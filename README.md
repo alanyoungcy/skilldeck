@@ -13,6 +13,8 @@ source text / PDF
                                     └─► flat PDF (optional)
 ```
 
+![Streamlit UI: paste text or upload a PDF, confirm, then run outline → prompts → images → export](docs/streamlit-app.png)
+
 The slide-design half (outline + image prompts) is driven by the [`baoyu-slide-deck`](https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-slide-deck/SKILL.md) skill — included here as a vendored copy under `baoyu-skills/`. The export half (`editable_pptx/`) is local and turns any PNG slide deck into a real `.pptx` with editable text, native preset shapes, and matched fonts.
 
 ---
