@@ -1,0 +1,41 @@
+{
+  "layout": "comparison",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "The further you are from the domain, the less gen AI closes the gap"
+    },
+    {
+      "role": "caption",
+      "text": "AI helps with conception, where outsiders can keep up; it falters on execution, where domain judgment is required"
+    },
+    {
+      "role": "body",
+      "text": "Experts (writers): own domain language and taste — AI accelerates first drafts they can refine"
+    },
+    {
+      "role": "body",
+      "text": "Adjacent outsiders (marketers): understand the goal, can edit AI output critically — biggest relative gain"
+    },
+    {
+      "role": "body",
+      "text": "Distant outsiders (technologists): lack context to judge what to keep or cut"
+    },
+    {
+      "role": "callout",
+      "text": "the gen AI wall"
+    }
+  ],
+  "accent_color": "#DA1E28",
+  "secondary_color": "#D0E2FF",
+  "shape_hints": [
+    {
+      "kind": "divider",
+      "around": "x-axis-baseline"
+    },
+    {
+      "kind": "card",
+      "around": "each-persona-block"
+    }
+  ]
+}

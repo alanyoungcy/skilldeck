@@ -1,0 +1,15 @@
+# Optional defaults for `streamlit_app.py`.
+# Copy to `app_config.yaml` to activate.
+
+llm:
+  provider: openai         # openai | anthropic
+  model: ""                # e.g. gpt-4.1-mini, gpt-4o-mini, claude-3-5-sonnet-latest, ...
+  temperature: 0.2
+  max_tokens: 1500
+
+agent:
+  use_agent: true
+  max_iterations: 8
+
+inputs:
+  default_style_preset: blueprint

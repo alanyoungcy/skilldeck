@@ -1,0 +1,12 @@
+params:
+  style: corporate
+  audience: executives
+  language: auto
+  slides: 5
+  review_outline: false
+  review_prompts: false
+  dimensions: null
+  ref_usage: direct
+  image_aspect: '16:9'
+  image_size: 1920x1088
+refs: []

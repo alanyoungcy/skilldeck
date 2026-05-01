@@ -1,0 +1,41 @@
+{
+  "layout": "two_column",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "Two intelligences make bridgers — and four deliberate moves develop them"
+    },
+    {
+      "role": "sidebar",
+      "text": "Emotional intelligence: self-awareness, humility, empathy under ambiguity"
+    },
+    {
+      "role": "sidebar",
+      "text": "Contextual intelligence: reading metrics, culture, power dynamics, resistance signals"
+    },
+    {
+      "role": "body",
+      "text": "Zigzag paths · Cross-functional rotations · Stretch roles at boundaries · External communities"
+    },
+    {
+      "role": "callout",
+      "text": "Without air cover and recognition, bridgers burn out."
+    }
+  ],
+  "accent_color": "#DA1E28",
+  "secondary_color": "#D0E2FF",
+  "shape_hints": [
+    {
+      "kind": "card",
+      "around": "sidebar"
+    },
+    {
+      "kind": "chevron",
+      "around": "body"
+    },
+    {
+      "kind": "divider",
+      "around": "callout"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "layout": "bento_grid",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "Capture gen AI's value by redesigning work, not by flattening expertise"
+    },
+    {
+      "role": "caption",
+      "text": "Three moves to align AI deployment with the realities of the AI wall"
+    },
+    {
+      "role": "body",
+      "text": "01 Match — deploy gen AI where users have enough context to judge outputs; automate or redesign tasks where they don't"
+    },
+    {
+      "role": "body",
+      "text": "02 Redraw — blur boundaries between adjacent roles; resist forcing AI across large expertise gaps"
+    },
+    {
+      "role": "callout",
+      "text": "03 Protect — keep junior hiring and apprenticeship; teach foundational judgment, not only execution"
+    },
+    {
+      "role": "sidebar",
+      "text": "Foundation: enough domain knowledge to judge and improve AI outputs"
+    }
+  ],
+  "accent_color": "#DA1E28",
+  "secondary_color": "#D0E2FF",
+  "shape_hints": [
+    {
+      "kind": "card",
+      "around": "each-pillar-column"
+    },
+    {
+      "kind": "divider",
+      "around": "foundation-band"
+    }
+  ]
+}

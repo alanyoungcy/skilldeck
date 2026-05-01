@@ -1,0 +1,12 @@
+streamlit[pdf]
+pypdf
+langchain
+langchain-openai
+langchain-anthropic
+pydantic
+PyYAML
+python-dotenv
+pillow
+requests
+python-pptx
+img2pdf

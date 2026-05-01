@@ -1,0 +1,37 @@
+{
+  "layout": "kpi_grid_3",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "Gen AI lifts performance unevenly — distance from the domain decides how much"
+    },
+    {
+      "role": "caption",
+      "text": "Findings from a controlled experiment across writers, marketers, and technologists at IG Group"
+    },
+    {
+      "role": "kpi",
+      "text": "Marketers + AI ≥ writers + AI on idea generation"
+    },
+    {
+      "role": "kpi",
+      "text": "Nonexperts + AI still trail experts on writing"
+    },
+    {
+      "role": "kpi",
+      "text": "Technologists + AI ≈ no measurable lift"
+    }
+  ],
+  "accent_color": "#DA1E28",
+  "secondary_color": "#D0E2FF",
+  "shape_hints": [
+    {
+      "kind": "divider",
+      "around": "between-kpi-columns"
+    },
+    {
+      "kind": "divider",
+      "around": "top-accent-rule"
+    }
+  ]
+}
