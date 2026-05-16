@@ -2303,14 +2303,13 @@ confirmed_params: dict[str, Any] = {
 }
 
 # Persist source + analysis bookkeeping (mirrors the skill).
+# Use change-detection writes so Streamlit reruns don't create backup storms.
 deck_dir = get_session_deck_dir(topic_slug)
 ensure_dir(deck_dir)
-backup_if_exists(deck_dir / f"source-{topic_slug}.md")
-(deck_dir / f"source-{topic_slug}.md").write_text(combined_source, encoding="utf-8")
-backup_if_exists(deck_dir / "analysis.md")
-(deck_dir / "analysis.md").write_text(
+write_text_if_changed(deck_dir / f"source-{topic_slug}.md", combined_source)
+write_text_if_changed(
+    deck_dir / "analysis.md",
     yaml.safe_dump(analysis, sort_keys=False, allow_unicode=True),
-    encoding="utf-8",
 )
 
 refs_meta: list[dict[str, str]] = []
@@ -2319,8 +2318,7 @@ if ref_files:
     for i, f in enumerate(ref_files, start=1):
         ext = Path(f.name).suffix.lower() or ".png"
         dest = deck_dir / "refs" / f"{i:02d}-ref-{slugify(Path(f.name).stem)}{ext}"
-        backup_if_exists(dest)
-        dest.write_bytes(f.getvalue())
+        write_bytes_if_changed(dest, f.getvalue())
         refs_meta.append({"ref_id": f"{i:02d}", "filename": dest.name, "usage": ref_usage})
 
 # Configure step is interactive — once user clicks Confirm we move on.
@@ -2554,6 +2552,22 @@ elif sig != st.session_state.last_pipeline_sig:
     bus: ProgressBus | None = st.session_state.get(bus_state_key)
     worker: threading.Thread | None = st.session_state.get(thread_state_key)
 
+    # Recover cleanly if a prior run with the same signature left stale state
+    # (for example, failed/finished worker thread but same confirmed params).
+    stale_or_missing_worker = (
+        worker is None or (isinstance(worker, threading.Thread) and not worker.is_alive())
+    )
+    terminal_bus = (
+        bus is None
+        or bus.snapshot().overall_state in {"done", "error"}
+    )
+    if stale_or_missing_worker and terminal_bus:
+        st.session_state.pop(bus_state_key, None)
+        st.session_state.pop(thread_state_key, None)
+        st.session_state.pop(error_state_key, None)
+        bus = None
+        worker = None
+
     if bus is None:
         bus = ProgressBus()
         st.session_state[bus_state_key] = bus
@@ -2584,7 +2598,6 @@ elif sig != st.session_state.last_pipeline_sig:
                 run_pipeline(**worker_args)
             except Exception as exc:  # noqa: BLE001 - surface to UI
                 bus.mark_error(str(exc))
-                st.session_state[error_state_key] = str(exc)
 
         worker = threading.Thread(target=_run_pipeline_thread, daemon=True,
                                    name=f"skilldeck-pipeline-{topic_slug}")
@@ -2830,5 +2843,3 @@ if pdf_path.exists():
 # Final state: if review has any output, mark step 4 done.
 if pptx_path.exists() or pdf_path.exists() or images or charts:
     st.session_state._done_until = max(st.session_state._done_until, 3)
-
-
