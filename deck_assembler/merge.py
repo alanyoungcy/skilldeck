@@ -25,6 +25,7 @@ from pptx.util import Emu
 logger = logging.getLogger(__name__)
 
 SLIDE_PATTERN = re.compile(r"^(\d+)-slide-.*\.(png|jpg|jpeg|svg)$", re.IGNORECASE)
+BACKUP_PATTERN = re.compile(r"-backup-\d{8}-\d{6}")
 
 
 def _list_slide_artifacts(deck_dir: Path) -> list[tuple[int, str, Path]]:
@@ -32,6 +33,8 @@ def _list_slide_artifacts(deck_dir: Path) -> list[tuple[int, str, Path]]:
     out: list[tuple[int, str, Path]] = []
     for f in deck_dir.iterdir():
         if not f.is_file():
+            continue
+        if BACKUP_PATTERN.search(f.name):
             continue
         m = SLIDE_PATTERN.match(f.name)
         if not m:
@@ -50,6 +53,8 @@ def _build_image_deck(slides: list[Path], out_pptx: Path, deck_dir: Path) -> Non
     from editable_pptx.canvas import materialize_normalized_slides, resolve_target_canvas_wh
     from editable_pptx.env import (
         background_mode,
+        hybrid_cv_enabled,
+        hybrid_mineru_fallback_enabled,
         load_skilldeck_env,
         mineru_config,
         mineru_poll_timeout,
@@ -59,10 +64,15 @@ def _build_image_deck(slides: list[Path], out_pptx: Path, deck_dir: Path) -> Non
     repo_root = Path(__file__).resolve().parent.parent
     load_skilldeck_env(repo_root)
     cfg = mineru_config()
-    if not cfg["token"]:
+
+    use_hybrid = hybrid_cv_enabled()
+    use_mineru = bool(cfg["token"]) and (not use_hybrid or hybrid_mineru_fallback_enabled())
+    if not cfg["token"] and not use_hybrid:
         raise RuntimeError(
             "MINERU_TOKEN missing — required for image-slide editable export. "
-            "Set it in `.env` or use a chart-only deck."
+            "Either set MINERU_TOKEN in `.env`, switch to a chart-only deck, "
+            "or set EDITABLE_PPTX_LAYOUT_ENGINE=hybrid_cv to use the local "
+            "CV layout engine."
         )
 
     bg_mode = background_mode()
@@ -74,22 +84,32 @@ def _build_image_deck(slides: list[Path], out_pptx: Path, deck_dir: Path) -> Non
         normalized_dir = work_root / "normalized_slides"
         slides_for_pipeline = materialize_normalized_slides(slides, normalized_dir, tw, th)
 
-        mineru_dirs: list[Path] = []
+        mineru_dirs: list[Path | None] = []
         for i, slide_path in enumerate(slides_for_pipeline):
             wd = work_root / f"slide_{i:03d}"
-            logger.info("MinerU parse %s/%s: %s", i + 1, len(slides), slide_path.name)
-            try:
-                mdir = parse_slide_image(
-                    str(slide_path),
-                    token=cfg["token"],
-                    api_base=cfg["api_base"],
-                    model_version=cfg["model_version"],
-                    work_dir=wd,
-                    poll_timeout=timeout,
+            if use_mineru:
+                logger.info("MinerU parse %s/%s: %s", i + 1, len(slides), slide_path.name)
+                try:
+                    mdir = parse_slide_image(
+                        str(slide_path),
+                        token=cfg["token"],
+                        api_base=cfg["api_base"],
+                        model_version=cfg["model_version"],
+                        work_dir=wd,
+                        poll_timeout=timeout,
+                    )
+                    mineru_dirs.append(mdir)
+                except MinerUError as e:
+                    if not use_hybrid:
+                        raise RuntimeError(f"MinerU failed for {slide_path.name}: {e}") from e
+                    logger.warning("MinerU fallback unavailable for %s: %s", slide_path.name, e)
+                    mineru_dirs.append(None)
+            else:
+                logger.info(
+                    "Hybrid CV parse %s/%s without whole-slide MinerU fallback: %s",
+                    i + 1, len(slides), slide_path.name,
                 )
-                mineru_dirs.append(mdir)
-            except MinerUError as e:
-                raise RuntimeError(f"MinerU failed for {slide_path.name}: {e}") from e
+                mineru_dirs.append(None)
 
         export_editable_deck(
             [str(s) for s in slides_for_pipeline],

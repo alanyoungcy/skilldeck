@@ -12,6 +12,8 @@ from editable_pptx.assemble import export_editable_deck
 from editable_pptx.canvas import materialize_normalized_slides, resolve_target_canvas_wh
 from editable_pptx.env import (
     background_mode,
+    hybrid_cv_enabled,
+    hybrid_mineru_fallback_enabled,
     load_skilldeck_env,
     mineru_config,
     mineru_poll_timeout,
@@ -19,6 +21,7 @@ from editable_pptx.env import (
 from editable_pptx.mineru import MinerUError, parse_slide_image
 
 SLIDE_PATTERN = re.compile(r"^(\d+)-slide-.*\.(png|jpg|jpeg)$", re.IGNORECASE)
+BACKUP_PATTERN = re.compile(r"-backup-\d{8}-\d{6}")
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +31,11 @@ def list_slide_images(deck_dir: Path) -> list[Path]:
         raise SystemExit(f"Not a directory: {deck_dir}")
     slides: list[Path] = []
     for f in deck_dir.iterdir():
-        if f.is_file() and SLIDE_PATTERN.match(f.name):
+        if not f.is_file():
+            continue
+        if BACKUP_PATTERN.search(f.name):
+            continue
+        if SLIDE_PATTERN.match(f.name):
             slides.append(f)
     slides.sort(key=lambda p: int(SLIDE_PATTERN.match(p.name).group(1)))
     return slides
@@ -55,7 +62,9 @@ def main(argv: list[str] | None = None) -> None:
     load_skilldeck_env(repo_root)
 
     cfg = mineru_config()
-    if not cfg["token"]:
+    use_hybrid = hybrid_cv_enabled()
+    use_mineru = bool(cfg["token"]) and (not use_hybrid or hybrid_mineru_fallback_enabled())
+    if not cfg["token"] and not use_hybrid:
         raise SystemExit(
             "MINERU_TOKEN is missing. Set it in .env (see .env.example for editable export variables)."
         )
@@ -80,22 +89,34 @@ def main(argv: list[str] | None = None) -> None:
         normalized_dir = work_root / "normalized_slides"
         slides_for_pipeline = materialize_normalized_slides(slides, normalized_dir, tw, th)
 
-        mineru_dirs: list[Path] = []
+        mineru_dirs: list[Path | None] = []
         for i, slide_path in enumerate(slides_for_pipeline):
             wd = work_root / f"slide_{i:03d}"
-            logger.info("MinerU parse %s/%s: %s", i + 1, len(slides), slide_path.name)
-            try:
-                mdir = parse_slide_image(
-                    str(slide_path),
-                    token=cfg["token"],
-                    api_base=cfg["api_base"],
-                    model_version=cfg["model_version"],
-                    work_dir=wd,
-                    poll_timeout=timeout,
+            if use_mineru:
+                logger.info("MinerU parse %s/%s: %s", i + 1, len(slides), slide_path.name)
+                try:
+                    mdir = parse_slide_image(
+                        str(slide_path),
+                        token=cfg["token"],
+                        api_base=cfg["api_base"],
+                        model_version=cfg["model_version"],
+                        work_dir=wd,
+                        poll_timeout=timeout,
+                    )
+                    mineru_dirs.append(mdir)
+                except MinerUError as e:
+                    if not use_hybrid:
+                        raise SystemExit(f"MinerU failed for {slide_path.name}: {e}") from e
+                    logger.warning("MinerU fallback unavailable for %s: %s", slide_path.name, e)
+                    mineru_dirs.append(None)
+            else:
+                logger.info(
+                    "Hybrid CV parse %s/%s without whole-slide MinerU fallback: %s",
+                    i + 1,
+                    len(slides),
+                    slide_path.name,
                 )
-                mineru_dirs.append(mdir)
-            except MinerUError as e:
-                raise SystemExit(f"MinerU failed for {slide_path.name}: {e}") from e
+                mineru_dirs.append(None)
 
         export_editable_deck(
             [str(s) for s in slides_for_pipeline],

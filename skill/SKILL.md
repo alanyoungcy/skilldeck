@@ -113,7 +113,7 @@ Choose chart slides for any quantitative content (KPIs, bar/line/pie/donut/area,
 | `vector-illustration` | clean + vibrant + humanist + balanced | Creative, children's content |
 | `vintage` | paper + warm + editorial + balanced | Historical, heritage |
 
-Per-preset specs: `references/styles/<preset>.md`. Preset → dimension mapping: `references/dimensions/presets.md`.
+Per-preset specs: `references/styles/<preset>.md`. This directory is the canonical style registry and includes both plain markdown styles and migrated SVG layout-backed presets. Preset → dimension mapping: `references/dimensions/presets.md`.
 
 ### Dimensions (when "Custom dimensions" picked)
 
@@ -255,7 +255,7 @@ Summary displayed before the questions:
 
 ### Step 3: Generate Outline
 
-Resolve style: preset → `references/styles/{preset}.md`; custom dimensions → combine files in `references/dimensions/`. Build `STYLE_INSTRUCTIONS` from the resolved style, apply confirmed audience + language + slide count, follow `references/outline-template.md`, and save as `outline.md`.
+Resolve style: preset → `references/styles/{preset}.md`; custom dimensions → combine files in `references/dimensions/`. If a preset declares `kind: layout_template`, treat its SVG roster as composition guidance only; do not switch to native SVG template rendering. Build `STYLE_INSTRUCTIONS` from the resolved style, apply confirmed audience + language + slide count, follow `references/outline-template.md`, and save as `outline.md`.
 
 Stop here if `--outline-only`. Skip Step 4 if `skip_outline_review`.
 
@@ -346,7 +346,7 @@ See `references/modification-guide.md` for full details.
 | `references/content-rules.md` | Content guidelines |
 | `references/modification-guide.md` | Edit/add/delete workflows |
 | `references/editable-pptx.md` | Editable PPTX (`python -m editable_pptx`), env vars, limitations |
-| `references/styles/<preset>.md` | Per-preset specifications |
+| `references/styles/<preset>.md` | Unified per-preset specifications, including SVG layout-backed presets |
 | `references/dimensions/*.md` | Per-dimension specifications |
 | `references/config/preferences-schema.md` | EXTEND.md schema |
 

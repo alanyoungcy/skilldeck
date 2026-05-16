@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +61,7 @@ _KIND_TO_MSO: dict[str, int] = {
 }
 
 
-def _add_native_shape(slide, shape: dict[str, Any]) -> None:
+def _add_native_shape(slide, shape: dict[str, Any]):
     bb = shape["bbox"]
     x0, y0, x1, y1 = bb
     w = max(1.0, x1 - x0)
@@ -129,6 +130,7 @@ def _add_native_shape(slide, shape: dict[str, Any]) -> None:
             sp.text_frame.text = ""
     except Exception:
         pass
+    return sp
 
 
 def _add_flat_background(slide, slide_w_px: int, slide_h_px: int, page_bg: tuple[int, int, int] | None) -> None:
@@ -172,12 +174,13 @@ def add_slide_from_image(
     slide = prs.slides.add_slide(blank)
 
     shapes = shapes or []
+    grouped_refs: list[tuple[str | None, str | None, Any]] = []
 
     # --- background layer ---
     if flat_background:
         _add_flat_background(slide, slide_w_px, slide_h_px, page_bg)
     else:
-        bg_img = build_background(slide_image_path, elements, mode=bg_mode)
+        bg_img = build_background(slide_image_path, elements, mode=bg_mode, shapes=shapes)
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = Path(tmp.name)
             bg_img.save(tmp_path, "PNG")
@@ -196,7 +199,8 @@ def add_slide_from_image(
     for sh in shapes:
         if sh.get("z", "under") == "under":
             try:
-                _add_native_shape(slide, sh)
+                sp = _add_native_shape(slide, sh)
+                grouped_refs.append((sh.get("parent_id"), sh.get("candidate_id"), sp))
             except Exception as e:
                 logger.warning("under shape %s failed: %s", sh.get("kind"), e)
 
@@ -242,6 +246,7 @@ def add_slide_from_image(
         width = Inches(_pixels_to_inches(bw))
         height = Inches(_pixels_to_inches(bh))
         box = slide.shapes.add_textbox(left, top, width, height)
+        grouped_refs.append((el.get("parent_id"), None, box))
         try:
             box.fill.background()
         except Exception:
@@ -307,14 +312,38 @@ def add_slide_from_image(
     for sh in shapes:
         if sh.get("z", "under") == "over":
             try:
-                _add_native_shape(slide, sh)
+                sp = _add_native_shape(slide, sh)
+                grouped_refs.append((sh.get("parent_id"), sh.get("candidate_id"), sp))
             except Exception as e:
                 logger.warning("over shape %s failed: %s", sh.get("kind"), e)
+
+    _group_related_shapes(slide, grouped_refs)
+
+
+def _group_related_shapes(slide, refs: list[tuple[str | None, str | None, Any]]) -> None:
+    """Group container shapes with direct child shapes/text boxes when ids are available."""
+    by_candidate: dict[str, Any] = {cid: shape for _pid, cid, shape in refs if cid}
+    by_parent: dict[str, list[Any]] = {}
+    for pid, cid, shape in refs:
+        if not pid or pid == cid:
+            continue
+        by_parent.setdefault(pid, []).append(shape)
+    # Inner groups first, then outer groups. This is intentionally conservative:
+    # only direct parent relationships from the CV hierarchy are grouped.
+    for parent_id, children in sorted(by_parent.items(), key=lambda item: len(item[1])):
+        parent_shape = by_candidate.get(parent_id)
+        members = ([parent_shape] if parent_shape is not None else []) + children
+        if len(members) < 2:
+            continue
+        try:
+            slide.shapes.add_group_shape(members)
+        except Exception as e:
+            logger.debug("group shape failed for %s: %s", parent_id, e)
 
 
 def export_editable_deck(
     ordered_image_paths: list[str],
-    mineru_dirs: list[Path],
+    mineru_dirs: list[Path | None],
     output_pptx: Path,
     *,
     bg_mode: str,
@@ -339,84 +368,218 @@ def export_editable_deck(
             )
 
     from editable_pptx.env import (
+        analysis_cache_enabled,
+        analysis_workers,
         bg_flatten_enabled,
         crosscheck_enabled,
+        diagram_decompose_enabled,
+        diagram_decompose_max_items,
+        diagram_decompose_min_area_fraction,
         font_config,
+        hybrid_cv_enabled,
+        hybrid_min_area_fraction,
+        hybrid_recursion_depth,
+        layout_engine,
         layout_snap_enabled,
         shape_detect_enabled,
         snap_cluster_tol_px,
         snap_grid_px,
         text_pad_ratio,
         vlm_enabled,
+        vlm_style_model,
     )
+    from editable_pptx import analysis_cache
+    from editable_pptx.decompose import decompose_image_regions
     from editable_pptx.layout import elements_from_mineru_dir
-    from editable_pptx.openai_style import apply_openai_element_styles
+    from editable_pptx.openai_style import (
+        apply_styles_to_elements,
+        compute_openai_element_styles,
+    )
     from editable_pptx.shapes import detect_shapes
-    from editable_pptx.snap import snap_bboxes
+    from editable_pptx.snap import edge_snap_bboxes, snap_bboxes
 
     fc = font_config(deck_dir)
     pad = text_pad_ratio()
     do_snap = layout_snap_enabled()
     do_shapes = shape_detect_enabled()
     do_flat_bg = bg_flatten_enabled()
+    do_hybrid = hybrid_cv_enabled()
+    do_decompose = diagram_decompose_enabled()
+    do_cache = analysis_cache_enabled()
     grid = snap_grid_px()
     cluster_tol = snap_cluster_tol_px()
+    decompose_min_area = diagram_decompose_min_area_fraction()
+    decompose_max_items = diagram_decompose_max_items()
+    vlm_model_name = vlm_style_model()
+    layout_engine_name = layout_engine()
 
-    prs = Presentation()
-    first = True
-    for img, mdir in zip(ordered_image_paths, mineru_dirs):
+    def analyze_one(idx: int, img: str, mdir: Path | None) -> dict[str, Any]:
+        """Run layout + VLM + decompose for one slide.
+
+        Returns a dict with the per-slide state needed by the serial assembly
+        phase: `idx`, `img`, `slide_size`, `els`, `shapes_list`, `page_bg`.
+        """
         im = Image.open(img)
         slide_size = im.size
-        els = elements_from_mineru_dir(mdir, slide_size)
-
         page_bg: tuple[int, int, int] | None = None
-        if vlm_enabled():
-            logger.info("VLM style extraction for %s", img)
-            page_bg = apply_openai_element_styles(img, els)
-
-        # Optional spec hints from upstream planning (Stage 1).
-        layout_hints: list[str] = []
-        spec = _read_spec_for(img, deck_dir)
-        if spec:
-            arch = spec.get("layout")
-            if arch:
-                layout_hints.append(f"layout={arch}")
-            for sh in spec.get("shape_hints") or []:
-                k = sh.get("kind")
-                if k:
-                    layout_hints.append(f"hint:{k}")
-
         shapes_list: list[dict[str, Any]] = []
-        if do_shapes:
-            shapes_list = detect_shapes(img, els, slide_size, layout_hints=layout_hints)
+        if do_hybrid:
+            from editable_pptx.hybrid import analyze_slide_hybrid
+
+            els, shapes_list, page_bg, debug = analyze_slide_hybrid(
+                img,
+                mineru_dir=mdir,
+                min_area_fraction=hybrid_min_area_fraction(),
+                recursion_depth=hybrid_recursion_depth(),
+            )
+            logger.info("Hybrid layout analysis for %s: %s", img, debug)
+        else:
+            els = elements_from_mineru_dir(mdir, slide_size)
+
+        slide_stem = Path(img).stem
+        cache_file = analysis_cache.cache_path(deck_dir, slide_stem) if do_cache else None
+        cache_hit: dict[str, Any] | None = None
+        key: str | None = None
+        if do_cache and vlm_enabled():
+            key = analysis_cache.cache_key(
+                image_path=img,
+                vlm_model=vlm_model_name,
+                decompose_enabled=do_decompose,
+                decompose_min_area_fraction=decompose_min_area,
+                layout_engine=layout_engine_name,
+            )
+            cache_hit = analysis_cache.load(cache_file, key)
+
+        if cache_hit is not None:
+            logger.info("Analysis cache HIT for %s", img)
+            cached_styles = cache_hit.get("styles") or []
+            apply_styles_to_elements(els, cached_styles)
+            cached_bg = cache_hit.get("page_bg")
+            if cached_bg:
+                page_bg = page_bg or tuple(cached_bg)
+            shapes_list.extend(cache_hit.get("shapes") or [])
+            decompose_block = cache_hit.get("decompose") or {}
+            extra_shapes = decompose_block.get("extra_shapes") or []
+            extra_texts = decompose_block.get("extra_texts") or []
+            removed_idx = decompose_block.get("removed_indices") or []
+            if removed_idx:
+                drop = set(removed_idx)
+                els = [e for i, e in enumerate(els) if i not in drop]
+            if extra_texts:
+                els.extend(extra_texts)
+            if extra_shapes:
+                shapes_list.extend(extra_shapes)
+        else:
+            captured_styles: list[dict[str, Any]] = []
+            captured_bg: tuple[int, int, int] | None = None
+            if vlm_enabled():
+                logger.info("VLM style extraction for %s", img)
+                captured_styles, captured_bg = compute_openai_element_styles(img, els)
+                if captured_styles:
+                    apply_styles_to_elements(els, captured_styles)
+                page_bg = page_bg or captured_bg
+
+            layout_hints: list[str] = []
+            spec = _read_spec_for(img, deck_dir)
+            if spec:
+                arch = spec.get("layout")
+                if arch:
+                    layout_hints.append(f"layout={arch}")
+                for sh in spec.get("shape_hints") or []:
+                    k = sh.get("kind")
+                    if k:
+                        layout_hints.append(f"hint:{k}")
+
+            captured_shapes: list[dict[str, Any]] = []
+            if do_shapes and not do_hybrid:
+                captured_shapes = detect_shapes(img, els, slide_size, layout_hints=layout_hints)
+                shapes_list.extend(captured_shapes)
+            if do_hybrid:
+                edge_snap_bboxes(img, els, only_sources={"vlm_missing"})
+                edge_snap_bboxes(img, shapes_list, only_sources={"vlm_missing"})
+
+            extra_shapes_d: list[dict[str, Any]] = []
+            extra_texts_d: list[dict[str, Any]] = []
+            removed_idx_d: list[int] = []
+            if do_decompose:
+                extra_shapes_d, extra_texts_d, removed_idx_d = decompose_image_regions(
+                    img,
+                    els,
+                    slide_size,
+                    min_area_fraction=decompose_min_area,
+                    max_items_per_region=decompose_max_items,
+                )
+                if removed_idx_d:
+                    drop = set(removed_idx_d)
+                    els = [e for i, e in enumerate(els) if i not in drop]
+                if extra_texts_d:
+                    els.extend(extra_texts_d)
+                if extra_shapes_d:
+                    shapes_list.extend(extra_shapes_d)
+
+            if do_cache and vlm_enabled() and cache_file is not None and key is not None:
+                analysis_cache.save(
+                    cache_file,
+                    key,
+                    page_bg=captured_bg,
+                    styles=captured_styles,
+                    shapes=captured_shapes,
+                    decompose_extra_shapes=extra_shapes_d,
+                    decompose_extra_texts=extra_texts_d,
+                    decompose_removed_indices=removed_idx_d,
+                )
 
         if do_snap:
             snap_bboxes(
-                els,
-                grid_px=grid,
-                cluster_tol_px=cluster_tol,
-                slide_w_px=slide_size[0],
-                slide_h_px=slide_size[1],
+                els, grid_px=grid, cluster_tol_px=cluster_tol,
+                slide_w_px=slide_size[0], slide_h_px=slide_size[1],
             )
             snap_bboxes(
-                shapes_list,
-                grid_px=grid,
-                cluster_tol_px=cluster_tol,
-                slide_w_px=slide_size[0],
-                slide_h_px=slide_size[1],
+                shapes_list, grid_px=grid, cluster_tol_px=cluster_tol,
+                slide_w_px=slide_size[0], slide_h_px=slide_size[1],
             )
 
+        return {
+            "idx": idx,
+            "img": img,
+            "slide_size": slide_size,
+            "els": els,
+            "shapes_list": shapes_list,
+            "page_bg": page_bg,
+        }
+
+    # ---- Phase 1: parallel analysis. Workers default to 4; cap at slide count.
+    n_slides = len(ordered_image_paths)
+    workers = min(analysis_workers(), n_slides)
+    analysis_results: list[dict[str, Any]] = [None] * n_slides  # type: ignore[list-item]
+    if workers > 1 and n_slides > 1:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="slide-analysis") as ex:
+            futures = [
+                ex.submit(analyze_one, i, img, mdir)
+                for i, (img, mdir) in enumerate(zip(ordered_image_paths, mineru_dirs))
+            ]
+            for fut in futures:
+                result = fut.result()
+                analysis_results[result["idx"]] = result
+    else:
+        for i, (img, mdir) in enumerate(zip(ordered_image_paths, mineru_dirs)):
+            analysis_results[i] = analyze_one(i, img, mdir)
+
+    # ---- Phase 2: serial python-pptx assembly.
+    prs = Presentation()
+    first = True
+    for r in analysis_results:
         add_slide_from_image(
             prs,
-            img,
-            els,
+            r["img"],
+            r["els"],
             bg_mode=bg_mode,
             set_presentation_dimensions=first,
             text_pad=pad,
             font_body=fc["body"],
             font_title=fc["title"],
-            shapes=shapes_list,
-            page_bg=page_bg,
+            shapes=r["shapes_list"],
+            page_bg=r["page_bg"],
             flat_background=do_flat_bg,
         )
         first = False

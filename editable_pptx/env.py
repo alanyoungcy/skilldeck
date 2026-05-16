@@ -25,12 +25,29 @@ def mineru_config() -> dict[str, str]:
 
 
 def background_mode() -> str:
-    """edge | whiteout | none"""
-    return os.getenv("EDITABLE_PPTX_BG_MODE", "edge").strip().lower()
+    """inpaint | edge | whiteout | none"""
+    return os.getenv("EDITABLE_PPTX_BG_MODE", "inpaint").strip().lower()
 
 
 def mineru_poll_timeout() -> int:
     return int(os.getenv("MINERU_POLL_TIMEOUT", "600"))
+
+
+def layout_engine() -> str:
+    """mineru | hybrid_cv"""
+    raw = os.getenv("EDITABLE_PPTX_LAYOUT_ENGINE", "mineru").strip().lower()
+    if raw in {"hybrid", "hybrid_cv", "cv"}:
+        return "hybrid_cv"
+    return "mineru"
+
+
+def hybrid_cv_enabled() -> bool:
+    return layout_engine() == "hybrid_cv"
+
+
+def hybrid_mineru_fallback_enabled() -> bool:
+    """Allow whole-slide MinerU only as an explicit hybrid fallback."""
+    return _flag("EDITABLE_PPTX_HYBRID_MINERU_FALLBACK", "0")
 
 
 def text_pad_ratio() -> float:
@@ -96,6 +113,68 @@ def snap_cluster_tol_px() -> int:
 
 def crosscheck_enabled() -> bool:
     return vlm_enabled() and _flag("EDITABLE_PPTX_CROSSCHECK", "0")
+
+
+def diagram_decompose_enabled() -> bool:
+    """Whether to run a 2nd VLM pass that decomposes large image/figure/diagram
+    regions into editable shapes + text. Requires `vlm_enabled()`.
+    """
+    return vlm_enabled() and _flag("EDITABLE_PPTX_DECOMPOSE_DIAGRAMS", "1")
+
+
+def diagram_decompose_min_area_fraction() -> float:
+    """Smallest region (as fraction of slide area) that triggers decomposition.
+
+    0.05 means a region must cover at least 5% of the slide before we make a
+    VLM call to decompose it. Tune up to skip small icons; tune down to catch
+    tighter diagrams.
+    """
+    try:
+        v = float(os.getenv("EDITABLE_PPTX_DECOMPOSE_MIN_AREA_FRACTION", "0.05"))
+    except ValueError:
+        return 0.05
+    return max(0.0, min(1.0, v))
+
+
+def diagram_decompose_max_items() -> int:
+    """Cap on items per region (shapes + text) the VLM may return."""
+    try:
+        return max(1, int(os.getenv("EDITABLE_PPTX_DECOMPOSE_MAX_ITEMS", "30")))
+    except ValueError:
+        return 30
+
+
+def analysis_cache_enabled() -> bool:
+    """Reuse cached VLM/decompose state across runs when the input image,
+    style model, and decompose flag are unchanged.
+    """
+    return _flag("EDITABLE_PPTX_ANALYSIS_CACHE", "1")
+
+
+def analysis_workers() -> int:
+    """Worker count for per-slide VLM/decompose parallelism.
+
+    Default 4 — large enough to overlap network latency, small enough to keep
+    rate-limit pressure manageable. Override with EDITABLE_PPTX_ANALYSIS_WORKERS.
+    """
+    try:
+        return max(1, int(os.getenv("EDITABLE_PPTX_ANALYSIS_WORKERS", "4")))
+    except ValueError:
+        return 4
+
+
+def hybrid_recursion_depth() -> int:
+    try:
+        return max(0, min(3, int(os.getenv("EDITABLE_PPTX_HYBRID_RECURSION_DEPTH", "2"))))
+    except ValueError:
+        return 2
+
+
+def hybrid_min_area_fraction() -> float:
+    try:
+        return max(0.0001, float(os.getenv("EDITABLE_PPTX_HYBRID_MIN_AREA_FRACTION", "0.005")))
+    except ValueError:
+        return 0.005
 
 
 def soffice_path() -> str:

@@ -1,4 +1,5 @@
 streamlit[pdf]
+streamlit-autorefresh
 pypdf
 langchain
 langchain-openai
@@ -10,3 +11,4 @@ pillow
 requests
 python-pptx
 img2pdf
+opencv-python-headless

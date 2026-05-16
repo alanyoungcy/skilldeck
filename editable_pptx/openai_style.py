@@ -187,14 +187,19 @@ def _local_color(
         return None
 
 
-def apply_openai_element_styles(image_path: str, elements: list[dict[str, Any]]) -> tuple[int, int, int] | None:
-    """Mutate elements in place: set el['style'] with bold, italic, underline, align,
-    color_rgb, font_family_hint, weight. Returns inferred page background RGB (or None)."""
+def compute_openai_element_styles(
+    image_path: str, elements: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], tuple[int, int, int] | None]:
+    """Return (per-text-element styles, page_bg) without mutating input.
+
+    The styles list is parallel to `[e for e in elements if (e.get('content') or '').strip()]`.
+    Indices in the returned list match the order of those text elements.
+    """
     if not vlm_enabled():
-        return None
+        return [], None
     text_els = [e for e in elements if (e.get("content") or "").strip()]
     if not text_els:
-        return None
+        return [], None
     url = chat_completions_url()
     api_key = vlm_api_key()
     model = vlm_style_model()
@@ -216,16 +221,37 @@ def apply_openai_element_styles(image_path: str, elements: list[dict[str, Any]])
                 logger.debug("local color %s: %s", i, e)
                 local_colors[i] = None
 
+    styles: list[dict[str, Any]] = []
     for i, el in enumerate(text_els):
         g = global_map.get(i, {})
-        sty: dict[str, Any] = {
-            "bold": g.get("bold", False),
-            "italic": g.get("italic", False),
-            "underline": g.get("underline", False),
-            "align": g.get("align", "left"),
-            "color_rgb": local_colors.get(i) or g.get("color_rgb"),
-            "font_family_hint": g.get("font_family_hint", "sans-serif"),
-            "weight": g.get("weight", "regular"),
-        }
-        el["style"] = sty
+        existing = el.get("style") if isinstance(el.get("style"), dict) else {}
+        styles.append(
+            {
+                "bold": g.get("bold", False),
+                "italic": g.get("italic", False),
+                "underline": g.get("underline", False),
+                "align": g.get("align", "left"),
+                "color_rgb": existing.get("color_rgb") or local_colors.get(i) or g.get("color_rgb"),
+                "font_family_hint": g.get("font_family_hint", "sans-serif"),
+                "weight": g.get("weight", "regular"),
+            }
+        )
+    return styles, page_bg
+
+
+def apply_styles_to_elements(
+    elements: list[dict[str, Any]], styles: list[dict[str, Any]]
+) -> None:
+    """Write each style dict onto the corresponding text element (by index in
+    `[e for e in elements if (e.get('content') or '').strip()]`)."""
+    text_els = [e for e in elements if (e.get("content") or "").strip()]
+    for el, sty in zip(text_els, styles):
+        el["style"] = dict(sty)
+
+
+def apply_openai_element_styles(image_path: str, elements: list[dict[str, Any]]) -> tuple[int, int, int] | None:
+    """Backwards-compatible wrapper: compute styles and apply them in place."""
+    styles, page_bg = compute_openai_element_styles(image_path, elements)
+    if styles:
+        apply_styles_to_elements(elements, styles)
     return page_bg

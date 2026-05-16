@@ -1,6 +1,6 @@
 # Editable PPTX export (Path B in this repo)
 
-Slide images (`NN-slide-*.png`) are turned into a **native, editable** `.pptx`: vector text boxes and figures on top of a background where rasterized text has been masked (**edge**-sampled fill by default, or solid white) so you do not see double text.
+Slide images (`NN-slide-*.png`) are turned into a **native, editable** `.pptx`: vector text boxes and figures on top of a background where rasterized text has been masked with OpenCV inpainting by default, or edge/whiteout fallback modes.
 
 ## Command
 
@@ -12,20 +12,24 @@ python -m editable_pptx slide-deck/<topic-slug> [-o out.pptx]
 
 ## Environment variables
 
-### MinerU (layout)
+### Layout engine and MinerU
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `MINERU_TOKEN` | **Yes** | MinerU v4 API bearer token |
+| `EDITABLE_PPTX_LAYOUT_ENGINE` | No | `mineru` (legacy whole-slide MinerU) or `hybrid_cv` (OpenCV candidates + VLM Set-of-Mark classification). Default `mineru`. |
+| `MINERU_TOKEN` | MinerU engine only | MinerU v4 API bearer token. Optional in `hybrid_cv`; whole-slide MinerU fallback is disabled unless explicitly enabled. |
 | `MINERU_API_BASE` | No | Default `https://mineru.net` |
 | `MINERU_MODEL_VERSION` | No | `vlm` or `pipeline` |
 | `MINERU_POLL_TIMEOUT` | No | Poll seconds (default `600`) |
+| `EDITABLE_PPTX_HYBRID_RECURSION_DEPTH` | No | Recursive OpenCV re-detection depth for containers; default `2`. |
+| `EDITABLE_PPTX_HYBRID_MIN_AREA_FRACTION` | No | Minimum CV candidate area as slide fraction; default `0.005`. Lower values increase recall and noise. |
+| `EDITABLE_PPTX_HYBRID_MINERU_FALLBACK` | No | Set `1` to allow whole-slide MinerU text fallback in `hybrid_cv`. Default `0`. |
 
 ### Background and layout
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `EDITABLE_PPTX_BG_MODE` | `edge` | `edge` (average color outside bbox), `whiteout` (solid mask), `none` (raw; double-text risk) |
+| `EDITABLE_PPTX_BG_MODE` | `inpaint` | `inpaint` (OpenCV Telea), `edge` (average color outside bbox), `whiteout` (solid mask), `none` (raw; double-text risk) |
 | `EDITABLE_PPTX_TEXT_PAD` | `1.005` | Text box size vs MinerU bbox |
 | `EDITABLE_PPTX_BG_FLATTEN` | `0` | When `1`, drop the full-page bitmap and paint a flat fill from the VLM-inferred page background color. Combine with shape detection for a fully reconstructed look. |
 | `EDITABLE_PPTX_LAYOUT_SNAP` | `1` | Snap element bboxes to a pixel grid then cluster shared edges/centers so columns line up. |
@@ -58,8 +62,8 @@ specific archetype.
 | `EDITABLE_PPTX_CROSSCHECK` | `0` | When `1`, render the produced PPTX back to PNGs via LibreOffice and ask the VLM to score each slide vs the source. Writes `crosscheck_report.json` next to the deck. |
 | `EDITABLE_PPTX_SOFFICE` | autodetect | Path to the `soffice` binary (default tries `/Applications/LibreOffice.app/Contents/MacOS/soffice` then `$PATH`). |
 
-The crosscheck is a quality gate — it does not auto-retry; it just logs
-slides whose similarity score is below `0.6` so you know which to inspect.
+The crosscheck is a quality gate — it does not auto-retry; it logs slides
+whose similarity score is below `0.6` so you know which to inspect.
 
 ### Fonts
 
@@ -97,8 +101,9 @@ Planning and image generation for Streamlit use `PLANNING_*` and `IMAGE_*`; see 
 
 ## Limitations
 
-- Layout is **MinerU-only** for typed regions (no hybrid OCR); decorative shapes are recovered by a separate VLM call.
-- True **inpainting** (generative clean background) is not implemented; use `edge`, `whiteout`, or the new `EDITABLE_PPTX_BG_FLATTEN=1` flat-fill mode (best when shape detection is reliable).
+- `hybrid_cv` is the higher-recall path for card grids and nested geometric layouts. It uses OpenCV for coordinates and VLM only for semantic classification/transcription.
+- `mineru` remains available as the compatibility path for document-like slides.
+- Targeted auto-retry from crosscheck is not implemented yet; inspect low-score slides and regenerate/export as needed.
 - **Font family** in PPTX is selected from a hint table (`editable_pptx/fonts.py`); the image model's exact font is only approximated. Override with `EDITABLE_PPTX_FONT_NAME` / `EDITABLE_PPTX_TITLE_FONT_NAME`.
 - All slides should share the **same pixel dimensions** for best alignment.
 - Shape detection accuracy depends on the VLM. For complex illustrations the bitmap fallback kicks in automatically.

@@ -11,6 +11,15 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+try:
+    import cv2  # type: ignore
+    import numpy as np
+    from PIL import Image
+except ModuleNotFoundError:  # pragma: no cover - optional hybrid dependency
+    cv2 = None  # type: ignore[assignment]
+    np = None  # type: ignore[assignment]
+    Image = None  # type: ignore[assignment]
+
 
 def _snap_value(v: float, grid: int) -> float:
     if grid <= 1:
@@ -108,3 +117,71 @@ def snap_bboxes(
         if ny1 - ny0 < grid_px:
             ny1 = ny0 + max(grid_px, y1 - y0)
         el["bbox"] = [nx0, ny0, nx1, ny1]
+
+
+def edge_snap_bboxes(
+    image_path: str,
+    elements: list[dict[str, Any]],
+    *,
+    window_px: int = 15,
+    only_sources: set[str] | None = None,
+) -> None:
+    """Snap VLM-origin bboxes to nearby strong Canny edges.
+
+    OpenCV-origin bboxes are already pixel-grounded, so callers typically pass
+    only_sources={"vlm_missing"}.
+    """
+    if cv2 is None or np is None or Image is None:
+        return
+    im = Image.open(image_path).convert("RGB")
+    arr = np.array(im)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    h, w = edges.shape[:2]
+    for el in elements:
+        if only_sources and el.get("source") not in only_sources:
+            continue
+        bb = el.get("bbox")
+        if not bb or len(bb) != 4:
+            continue
+        x0, y0, x1, y1 = [float(v) for v in bb]
+        el["bbox"] = [
+            _snap_vertical_edge(edges, x0, y0, y1, window_px, w),
+            _snap_horizontal_edge(edges, y0, x0, x1, window_px, h),
+            _snap_vertical_edge(edges, x1, y0, y1, window_px, w),
+            _snap_horizontal_edge(edges, y1, x0, x1, window_px, h),
+        ]
+
+
+def _snap_vertical_edge(edges, x: float, y0: float, y1: float, window: int, width: int) -> float:
+    xi = int(round(x))
+    ya = max(0, int(round(min(y0, y1))))
+    yb = min(edges.shape[0], int(round(max(y0, y1))))
+    xa = max(0, xi - window)
+    xb = min(width, xi + window + 1)
+    if xb <= xa or yb <= ya:
+        return x
+    strip = edges[ya:yb, xa:xb]
+    if strip.size == 0:
+        return x
+    scores = strip.sum(axis=0)
+    if scores.max() <= 0:
+        return x
+    return float(xa + int(scores.argmax()))
+
+
+def _snap_horizontal_edge(edges, y: float, x0: float, x1: float, window: int, height: int) -> float:
+    yi = int(round(y))
+    xa = max(0, int(round(min(x0, x1))))
+    xb = min(edges.shape[1], int(round(max(x0, x1))))
+    ya = max(0, yi - window)
+    yb = min(height, yi + window + 1)
+    if xb <= xa or yb <= ya:
+        return y
+    strip = edges[ya:yb, xa:xb]
+    if strip.size == 0:
+        return y
+    scores = strip.sum(axis=1)
+    if scores.max() <= 0:
+        return y
+    return float(ya + int(scores.argmax()))

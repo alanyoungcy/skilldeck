@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,29 @@ from PIL import Image, ImageOps
 from pypdf import PdfReader
 from dotenv import load_dotenv
 
-from notebooklm_style_agent.refs import list_style_presets, load_style_preset_text
+from notebooklm_style_agent.refs import StylePreset, list_style_presets, load_style_preset_text
+from progress import ProgressBus, Stage
+from concept import (
+    ConceptError,
+    generate_style_anchor,
+    generate_visual_concept,
+    hash_outline_block,
+    is_concept_stale,
+    read_concept_file,
+    render_concept_prompt,
+    write_concept_file,
+)
+from skilldeck_utils import (
+    backup_if_exists,
+    is_active_slide_file,
+    list_active_slide_files,
+    now_ts,
+    pdf_cache_is_fresh,
+    resolve_pdf_export_flag,
+    write_bytes_if_changed,
+    write_pdf_cache,
+    write_text_if_changed,
+)
 
 REPO_DIR = Path(__file__).resolve().parent
 SKILL_DIR = REPO_DIR / "skill"
@@ -60,10 +83,6 @@ SIGNALS_TO_PRESET: list[tuple[list[str], str]] = [
 ]
 
 
-def now_ts() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
-
-
 def slugify(text: str) -> str:
     t = text.strip().lower()
     t = re.sub(r"[^a-z0-9\s-]+", "", t)
@@ -98,12 +117,9 @@ def recommend_style_preset(text: str) -> str:
     return "blueprint"
 
 
-def backup_if_exists(path: Path) -> None:
-    if not path.exists():
-        return
-    ts = now_ts()
-    backup = path.with_name(f"{path.stem}-backup-{ts}{path.suffix}")
-    shutil.move(str(path), str(backup))
+def format_style_preset_label(preset_name: str, presets: list[StylePreset]) -> str:
+    preset = next((p for p in presets if p.name == preset_name), None)
+    return preset.label if preset is not None else preset_name
 
 
 def ensure_dir(p: Path) -> None:
@@ -438,6 +454,118 @@ def _slide_filename(slide_block: str, fallback_ext: str = "png") -> str:
     return f"{now_ts()}-slide.{fallback_ext}"
 
 
+def _slide_field(slide_block: str, name: str) -> str:
+    """Extract a `Name: value` line from a slide block.
+
+    Looks for both the Markdown `**Name**: value` form and the inline
+    `Name: value` form used inside `// KEY CONTENT` blocks. Returns the
+    first match or empty string.
+    """
+    m = re.search(rf"^\*\*{re.escape(name)}\*\*:\s*(.+)$", slide_block, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(rf"^{re.escape(name)}:\s*(.+)$", slide_block, re.MULTILINE | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _slide_body_bullets(slide_block: str) -> list[str]:
+    """Extract the `Body:` bullet list from a slide block.
+
+    Handles the SKILL outline's two shapes:
+      Body:
+      - first point
+      - second point
+    and the inline-on-one-line "Body: text" fallback (rare; treated as one bullet).
+    """
+    # Find the literal "Body:" line and read the consecutive `- ...` lines below it.
+    lines = slide_block.splitlines()
+    bullets: list[str] = []
+    in_body = False
+    for raw in lines:
+        stripped = raw.strip()
+        if not in_body:
+            m = re.match(r"^(?:\*\*Body\*\*|Body)\s*:\s*(.*)$", stripped, re.IGNORECASE)
+            if m:
+                in_body = True
+                tail = m.group(1).strip()
+                if tail and not tail.startswith("-"):
+                    bullets.append(tail)
+                continue
+        else:
+            if stripped.startswith("- "):
+                bullets.append(stripped[2:].strip())
+                continue
+            if stripped == "" or stripped.startswith("//") or stripped.startswith("**"):
+                # End of body block.
+                break
+    return [b for b in bullets if b]
+
+
+def _slide_role(slide_block: str) -> str:
+    """Slide role: 'cover' | 'back-cover' | 'content' | (custom)."""
+    explicit = _slide_field(slide_block, "Role")
+    if explicit:
+        return explicit.lower()
+    typ = _slide_field(slide_block, "Type").lower()
+    if "back cover" in typ:
+        return "back-cover"
+    if typ == "cover":
+        return "cover"
+    return "content"
+
+
+def _slide_architype(slide_block: str) -> str:
+    """Layout architype name. Falls back to a role-driven default."""
+    layout = _slide_field(slide_block, "Layout")
+    if layout:
+        return layout.lower()
+    role = _slide_role(slide_block)
+    return {
+        "cover": "title-hero",
+        "back-cover": "quote-callout",
+    }.get(role, "hero_with_bullets")
+
+
+def _architype_description(name: str) -> str:
+    """Short human-readable description for a layout architype.
+
+    Keeps the Stage 4 prompt self-contained; the LLM doesn't need the full
+    layout gallery, just enough context to compose. Unknown architypes fall
+    back to a generic description.
+    """
+    desc = {
+        "title-hero": "large centered title + subtitle on a hero visual",
+        "metaphor_split": "visual metaphor on one side, text reserved on the other",
+        "two_column_compare": "side-by-side A vs B, parallel framing",
+        "data_with_visual": "chart on one side, illustrative concept on the other",
+        "hero_with_bullets": "one focal visual + supporting bullet list",
+        "full_bleed_hero": "one dominant image, headline overlaid on a quiet zone",
+        "icon-grid": "grid of icons with labels for features or benefits",
+        "split-screen": "half image, half text",
+        "quote-callout": "featured quote with attribution",
+        "key-stat": "single large number as focal point",
+        "agenda": "numbered list with highlights",
+        "bullet-list": "structured bullet points",
+        "linear-progression": "sequential flow left-to-right (timeline / steps)",
+        "binary-comparison": "side-by-side A vs B (before/after, pros/cons)",
+        "comparison-matrix": "multi-factor grid",
+        "hierarchical-layers": "pyramid or stacked levels",
+        "hub-spoke": "central node with radiating items",
+        "bento-grid": "varied-size tiles",
+        "funnel": "narrowing stages",
+        "dashboard": "metrics with charts/numbers",
+        "venn-diagram": "overlapping circles",
+        "circular-flow": "continuous cycle",
+        "winding-roadmap": "curved path with milestones",
+        "tree-branching": "parent-child hierarchy",
+        "iceberg": "visible vs hidden layers",
+        "bridge": "gap with connection (problem-solution)",
+    }
+    return desc.get(name.lower(), "one focal visual + supporting text")
+
+
 def write_prompt_files(*, deck_dir: Path, outline_md: str) -> None:
     style_block = parse_style_instructions(outline_md)
     slides_blocks = parse_slides(outline_md)
@@ -459,18 +587,17 @@ def write_prompt_files(*, deck_dir: Path, outline_md: str) -> None:
             filename = _slide_filename(sb, fallback_ext="svg")
             stem = Path(filename).with_suffix("").name
             chart_path = deck_dir / "prompts" / f"{stem}.chart.json"
-            backup_if_exists(chart_path)
             import json as _json
 
-            chart_path.write_text(
-                _json.dumps(chart_spec, ensure_ascii=False, indent=2), encoding="utf-8"
+            write_text_if_changed(
+                chart_path,
+                _json.dumps(chart_spec, ensure_ascii=False, indent=2),
             )
             continue
 
         filename = _slide_filename(sb, fallback_ext="png")
         stem = Path(filename).with_suffix("").name
         prompt_md_path = deck_dir / "prompts" / f"{stem}.md"
-        backup_if_exists(prompt_md_path)
         prompt_body = (
             base_prompt.strip()
             + "\n\n---\n\n## STYLE_INSTRUCTIONS\n\n"
@@ -479,14 +606,76 @@ def write_prompt_files(*, deck_dir: Path, outline_md: str) -> None:
             + sb.strip()
             + "\n"
         )
-        prompt_md_path.write_text(prompt_body, encoding="utf-8")
+        write_text_if_changed(prompt_md_path, prompt_body)
 
         spec = _extract_design_spec(sb)
         if spec is not None:
             import json as _json
 
             spec_path = deck_dir / "prompts" / f"{stem}.spec.json"
-            spec_path.write_text(_json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_text_if_changed(
+                spec_path,
+                _json.dumps(spec, ensure_ascii=False, indent=2),
+            )
+
+
+def _render_concept_prompt(*, concept_payload: dict[str, Any], style_anchor: str) -> str:
+    """Backwards-compatible wrapper around `concept.render_concept_prompt`."""
+    return render_concept_prompt(concept_payload=concept_payload, style_anchor=style_anchor)
+
+
+def _read_anchor_for_preset(deck_dir: Path) -> str:
+    """Read whichever cached style-anchor sits in the deck's anchor cache.
+
+    We don't track which anchor key applies — there's only one preset per
+    deck — so we just take the most recent value. Returns "" if no cache.
+    """
+    cache_path = deck_dir / ".style-anchor-cache.json"
+    if not cache_path.is_file():
+        return ""
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(cache, dict) and cache:
+            # Cache values are anchor sentences; just return any one.
+            return next(iter(cache.values()), "")
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def rewrite_image_prompts_with_concepts(*, deck_dir: Path, outline_md: str) -> int:
+    """For each image slide that has a `.concept.json`, rewrite the matching
+    `prompts/NN-slide-{slug}.md` to the templated concept-driven prompt.
+
+    Slides without a concept.json keep their existing prompt body
+    (backwards-compat with `write_prompt_files`).
+
+    Returns the number of prompt files rewritten this call.
+    """
+    prompts_dir = deck_dir / "prompts"
+    if not prompts_dir.is_dir():
+        return 0
+
+    style_anchor = _read_anchor_for_preset(deck_dir)
+    if not style_anchor:
+        # Without an anchor, the templated form would lose its style lock.
+        # Leave the existing prompts alone — the old <STYLE_INSTRUCTIONS>
+        # path still works.
+        return 0
+
+    rewritten = 0
+    for prompt_path in list_active_slide_files(prompts_dir, ".md"):
+        stem = prompt_path.stem
+        concept_path = prompts_dir / f"{stem}.concept.json"
+        concept_payload = read_concept_file(concept_path)
+        if concept_payload is None:
+            continue
+        new_body = _render_concept_prompt(
+            concept_payload=concept_payload, style_anchor=style_anchor,
+        )
+        if write_text_if_changed(prompt_path, new_body):
+            rewritten += 1
+    return rewritten
 
 
 def sanitize_outline_md(text: str) -> str:
@@ -645,7 +834,7 @@ def generate_outline_with_retry(
     )
 
 
-def render_chart_slides(*, deck_dir: Path) -> int:
+def render_chart_slides(*, deck_dir: Path, progress: ProgressBus | None = None) -> int:
     """Render every prompts/*.chart.json into a sibling SVG in deck_dir.
 
     Returns the number of charts rendered. Safe to call when no chart specs exist.
@@ -657,21 +846,187 @@ def render_chart_slides(*, deck_dir: Path) -> int:
         # leave skill/scripts on the path (other helpers may rely on it later)
         pass
 
-    chart_files = sorted((deck_dir / "prompts").glob("*.chart.json"))
+    chart_files = list_active_slide_files(deck_dir / "prompts", ".chart.json")
+    total = len(chart_files)
+    if progress is not None:
+        if total:
+            progress.start_stage(Stage.CHARTS, items_total=total,
+                                 detail=f"Rendering {total} chart slide{'s' if total != 1 else ''}")
+        else:
+            progress.skip_stage(Stage.CHARTS, "no chart specs")
     rendered = 0
     for cf in chart_files:
         try:
             spec = json.loads(cf.read_text(encoding="utf-8"))
         except Exception as e:
+            if progress is not None:
+                progress.fail_stage(Stage.CHARTS, f"Bad chart spec in {cf.name}: {e}")
             raise RuntimeError(f"Bad chart spec in {cf.name}: {e}") from e
         stem = cf.name[: -len(".chart.json")]
         out_path = deck_dir / f"{stem}.svg"
-        backup_if_exists(out_path)
         svg = render_chart_svg(spec)
-        out_path.write_text(svg, encoding="utf-8")
-        st.write(f"Rendered chart {rendered + 1}: `{out_path.name}` (template: {spec.get('template')})")
+        wrote = write_text_if_changed(out_path, svg)
+        msg = (
+            f"{'Rendered' if wrote else 'Reused'} chart {rendered + 1}/{total}: "
+            f"`{out_path.name}` (template: {spec.get('template')})"
+        )
+        st.write(msg)
+        if progress is not None:
+            progress.update_stage(Stage.CHARTS, items_done=rendered + 1,
+                                  detail=f"Rendered {rendered + 1}/{total}: {out_path.name}")
+            progress.emit_event(msg, stage=Stage.CHARTS)
         rendered += 1
+    if progress is not None and total:
+        progress.end_stage(Stage.CHARTS, detail=f"{rendered} chart slide{'s' if rendered != 1 else ''} ready")
     return rendered
+
+
+def generate_concepts(
+    *,
+    deck_dir: Path,
+    outline_md: str,
+    style_spec: str,
+    style_preset_name: str,
+    planning_base_url: str,
+    planning_api_key: str,
+    planning_model: str,
+    planning_max_tokens: int,
+    progress: ProgressBus | None = None,
+) -> int:
+    """Stage 4: write `prompts/NN-slide-{slug}.concept.json` for each image slide.
+
+    Sequential per slide. Skips chart slides (they bypass image gen entirely).
+    Skips slides whose concept.json is fresh (outline_hash matches) or has
+    been edited by the user (concept hash drifted from `original_hash`).
+
+    Returns the number of concepts generated this run.
+    """
+    slides_blocks = parse_slides(outline_md)
+    image_blocks = [sb for sb in slides_blocks if _slide_render_kind(sb) == "image"]
+
+    if not image_blocks:
+        if progress is not None:
+            progress.skip_stage(Stage.CONCEPTS, "no image slides")
+        return 0
+
+    if progress is not None:
+        progress.start_stage(
+            Stage.CONCEPTS,
+            items_total=len(image_blocks),
+            detail="Generating visual concepts",
+        )
+
+    def _chat_call(*, messages: list[dict[str, Any]], model: str, max_tokens: int) -> str:
+        return chat_completion_openai_compatible(
+            base_url=planning_base_url,
+            api_key=planning_api_key,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+
+    # Stage 4 anchor — once per run, cached by (style_spec, planning_model).
+    style_anchor = generate_style_anchor(
+        style_spec=style_spec,
+        deck_dir=deck_dir,
+        planning_model=planning_model,
+        chat_call=_chat_call,
+    )
+    if progress is not None:
+        progress.emit_event(
+            f"Style anchor: {style_anchor[:140]}{'…' if len(style_anchor) > 140 else ''}",
+            stage=Stage.CONCEPTS,
+        )
+
+    examples_text = read_ref_text("concept-examples.md")
+    prompts_dir = deck_dir / "prompts"
+    ensure_dir(prompts_dir)
+
+    generated = 0
+    for idx, sb in enumerate(image_blocks, start=1):
+        filename = _slide_filename(sb, fallback_ext="png")
+        stem = Path(filename).with_suffix("").name
+        concept_path = prompts_dir / f"{stem}.concept.json"
+
+        outline_hash = hash_outline_block(sb)
+        if not is_concept_stale(concept_path, outline_hash):
+            existing = read_concept_file(concept_path)
+            tag = "user-edited" if (
+                existing
+                and existing.get("original_hash")
+                and outline_hash != existing.get("outline_hash")
+            ) else "fresh"
+            msg = f"Reused {idx}/{len(image_blocks)}: {concept_path.name} ({tag})"
+            st.write(msg)
+            if progress is not None:
+                progress.update_stage(
+                    Stage.CONCEPTS, items_done=idx,
+                    detail=f"Reused {idx}/{len(image_blocks)} (cache hit)",
+                )
+                progress.emit_event(msg, stage=Stage.CONCEPTS)
+            continue
+
+        role = _slide_role(sb)
+        architype = _slide_architype(sb)
+        architype_desc = _architype_description(architype)
+        headline = _slide_field(sb, "Headline")
+        subhead = _slide_field(sb, "Sub-headline") or _slide_field(sb, "Subhead")
+        body_bullets = _slide_body_bullets(sb)
+        slide_number_match = re.search(r"^##\s*Slide\s+(\d+)\s+of\s+\d+", sb, re.MULTILINE)
+        slide_number = int(slide_number_match.group(1)) if slide_number_match else idx
+
+        try:
+            result = generate_visual_concept(
+                slide_block=sb,
+                role=role,
+                architype=architype,
+                architype_description=architype_desc,
+                style_preset=style_preset_name,
+                style_anchor=style_anchor,
+                examples_text=examples_text,
+                chat_call=_chat_call,
+                planning_model=planning_model,
+            )
+        except ConceptError as e:
+            err = f"Concept generation failed for `{stem}`: {e}"
+            if progress is not None:
+                progress.fail_stage(Stage.CONCEPTS, err)
+            raise RuntimeError(err) from e
+        except Exception as e:
+            err = f"Concept generation network/API error for `{stem}`: {e}"
+            if progress is not None:
+                progress.fail_stage(Stage.CONCEPTS, err)
+            raise RuntimeError(err) from e
+
+        write_concept_file(
+            concept_path,
+            slide_id=stem,
+            slide_number=slide_number,
+            role=role,
+            architype=architype,
+            style_preset=style_preset_name,
+            headline=headline,
+            subhead=subhead,
+            body=body_bullets,
+            concept=result.concept,
+            outline_hash=outline_hash,
+        )
+        generated += 1
+        msg = f"Generated {idx}/{len(image_blocks)}: {concept_path.name} (subject: {result.concept['subject'][:60]}…)"
+        st.write(msg)
+        if progress is not None:
+            progress.update_stage(
+                Stage.CONCEPTS, items_done=idx,
+                detail=f"Generated {idx}/{len(image_blocks)}: {concept_path.name}",
+            )
+            progress.emit_event(msg, stage=Stage.CONCEPTS)
+
+    if progress is not None:
+        progress.end_stage(
+            Stage.CONCEPTS,
+            detail=f"{generated} new, {len(image_blocks) - generated} cached",
+        )
+    return generated
 
 
 def generate_images_from_prompts(
@@ -681,18 +1036,43 @@ def generate_images_from_prompts(
     image_api_key: str,
     image_model: str,
     image_size: str,
+    progress: ProgressBus | None = None,
 ) -> None:
     prompts_dir = deck_dir / "prompts"
-    prompt_files = sorted(prompts_dir.glob("*.md"))
+    prompt_files = list_active_slide_files(prompts_dir, ".md")
     if not prompt_files:
+        if progress is not None:
+            progress.skip_stage(Stage.IMAGES, "no image prompts")
         raise RuntimeError("No prompt files found.")
 
     total = len(prompt_files)
+    if progress is not None:
+        progress.start_stage(Stage.IMAGES, items_total=total,
+                             detail=f"Generating {total} image slide{'s' if total != 1 else ''}")
     for idx, pf in enumerate(prompt_files, start=1):
         prompt_text = pf.read_text(encoding="utf-8")
         png_name = Path(pf.name).with_suffix(".png").name
         out_path = deck_dir / png_name
-        backup_if_exists(out_path)
+
+        # Skip-if-unchanged: hash prompt + (model, size) — if PNG exists and the
+        # sidecar matches, reuse the cached PNG instead of re-calling the API.
+        cache_key = hashlib.sha256(
+            f"{image_model}|{image_size}|{prompt_text}".encode("utf-8")
+        ).hexdigest()
+        cache_file = deck_dir / f".{Path(pf.name).stem}.imghash"
+        if (
+            out_path.exists()
+            and cache_file.exists()
+            and cache_file.read_text(encoding="utf-8").strip() == cache_key
+        ):
+            msg = f"Reused {idx}/{total}: `{png_name}` (prompt unchanged)"
+            st.write(msg)
+            if progress is not None:
+                progress.update_stage(Stage.IMAGES, items_done=idx,
+                                      detail=f"Reused {idx}/{total} (cache hit)")
+                progress.emit_event(msg, stage=Stage.IMAGES)
+            continue
+
         try:
             png_bytes = generate_image_openai_compatible(
                 base_url=image_base_url,
@@ -702,36 +1082,86 @@ def generate_images_from_prompts(
                 size=image_size,
             )
             png_bytes = normalize_generated_image_png(png_bytes, image_size)
+            backup_if_exists(out_path)
             out_path.write_bytes(png_bytes)
-            st.write(f"Generated {idx}/{total}: `{png_name}`")
+            cache_file.write_text(cache_key, encoding="utf-8")
+            msg = f"Generated {idx}/{total}: `{png_name}`"
+            st.write(msg)
+            if progress is not None:
+                progress.update_stage(Stage.IMAGES, items_done=idx,
+                                      detail=f"Generated {idx}/{total}: {png_name}")
+                progress.emit_event(msg, stage=Stage.IMAGES)
         except Exception as e:
-            raise RuntimeError(f"Image generation failed for `{pf.name}` → `{png_name}`: {e}") from e
+            err = f"Image generation failed for `{pf.name}` → `{png_name}`: {e}"
+            if progress is not None:
+                progress.fail_stage(Stage.IMAGES, err)
+            raise RuntimeError(err) from e
+
+    if progress is not None:
+        progress.end_stage(Stage.IMAGES, detail=f"{total} image slide{'s' if total != 1 else ''} ready")
 
 
-def merge_deck(*, deck_dir: Path) -> tuple[str, str]:
-    """Build editable PPTX via `python -m deck_assembler` (image + chart slides), then optional PDF via bun script."""
+def merge_deck(
+    *,
+    deck_dir: Path,
+    export_pdf: bool | None = None,
+    progress: ProgressBus | None = None,
+) -> tuple[str, str]:
+    """Build editable PPTX via `python -m deck_assembler` (image + chart slides), then optional PDF via bun script.
+
+    PDF export gating:
+      * `export_pdf=True` always runs PDF (when bun available).
+      * `export_pdf=False` skips PDF entirely.
+      * `export_pdf=None` (default) reads `SKILLDECK_EXPORT_PDF` env (default 1
+        for backwards compatibility).
+    PDF is also skipped when the PPTX hash matches the previous run's cached
+    hash and the PDF already exists.
+    """
     bun_x = resolve_bun_x()
     logs: list[str] = []
     err = ""
 
-    has_image_slides = any(re.match(r"^\d+-slide-.*\.(png|jpg|jpeg)$", p.name, re.IGNORECASE)
-                           for p in deck_dir.iterdir() if p.is_file())
-    has_chart_slides = any(re.match(r"^\d+-slide-.*\.svg$", p.name, re.IGNORECASE)
-                           for p in deck_dir.iterdir() if p.is_file())
+    export_pdf = resolve_pdf_export_flag(export_pdf)
 
-    if has_image_slides and not os.getenv("MINERU_TOKEN", "").strip():
-        logs.append(
+    has_image_slides = bool(list_active_slide_files(deck_dir, ".png")) or bool(
+        list_active_slide_files(deck_dir, ".jpg")
+    ) or bool(list_active_slide_files(deck_dir, ".jpeg"))
+    has_chart_slides = bool(list_active_slide_files(deck_dir, ".svg"))
+
+    layout_engine = (os.getenv("EDITABLE_PPTX_LAYOUT_ENGINE", "mineru") or "").strip().lower()
+    hybrid_cv_active = layout_engine in {"hybrid", "hybrid_cv", "cv"}
+    mineru_required = has_image_slides and not hybrid_cv_active
+
+    if mineru_required and not os.getenv("MINERU_TOKEN", "").strip():
+        msg = (
             "deck_assembler: skipped — image slides require MINERU_TOKEN (not set in `.env`). "
-            "Add it next to PLANNING_* / IMAGE_*; see `.env.example`."
+            "Add it next to PLANNING_* / IMAGE_*; see `.env.example`. "
+            "Or set EDITABLE_PPTX_LAYOUT_ENGINE=hybrid_cv to use the local CV layout engine."
         )
+        logs.append(msg)
         err = (
-            "Editable PPTX was skipped: set **MINERU_TOKEN** in `.env`. "
+            "Editable PPTX was skipped: set **MINERU_TOKEN** in `.env` "
+            "or set `EDITABLE_PPTX_LAYOUT_ENGINE=hybrid_cv`. "
             "PDF export still runs below if `bun` is available."
         )
+        if progress is not None:
+            progress.skip_stage(Stage.PPTX, "MINERU_TOKEN missing (and hybrid_cv not enabled)")
     elif not (has_image_slides or has_chart_slides):
         logs.append("deck_assembler: skipped — no slides found.")
         err = "No slide artifacts to export."
+        if progress is not None:
+            progress.skip_stage(Stage.PPTX, "no slide artifacts")
     else:
+        if progress is not None:
+            kinds = []
+            if has_image_slides:
+                kinds.append("image")
+            if has_chart_slides:
+                kinds.append("chart")
+            progress.start_stage(
+                Stage.PPTX,
+                detail=f"Assembling editable PPTX ({' + '.join(kinds)} slides)",
+            )
         py = sys.executable
         r = subprocess.run(
             [py, "-m", "deck_assembler", str(deck_dir)],
@@ -743,15 +1173,43 @@ def merge_deck(*, deck_dir: Path) -> tuple[str, str]:
         logs.append("deck_assembler:\n" + (r.stdout or "") + (r.stderr or ""))
         if r.returncode != 0:
             err = f"deck_assembler failed (exit {r.returncode}). Check log below; PDF may still have been built."
+            if progress is not None:
+                progress.fail_stage(Stage.PPTX, err)
+        elif progress is not None:
+            slug = deck_dir.name
+            progress.end_stage(Stage.PPTX, detail=f"{slug}.pptx written")
+
+    if not export_pdf:
+        logs.append("merge-to-pdf: skipped (SKILLDECK_EXPORT_PDF disabled)")
+        if progress is not None:
+            progress.skip_stage(Stage.PDF, "PDF export disabled")
+        return "\n\n".join(logs), err
 
     if not bun_x:
         logs.append("merge-to-pdf: skipped (missing `bun` and `npx`)")
+        if progress is not None:
+            progress.skip_stage(Stage.PDF, "missing bun/npx")
         return "\n\n".join(logs), err
 
     merge_pdf = SKILL_DIR / "scripts" / "merge-to-pdf.ts"
     if merge_pdf.exists():
+        slug = deck_dir.name
+        if pdf_cache_is_fresh(deck_dir, slug):
+            logs.append("merge-to-pdf: skipped (PPTX unchanged, cached PDF reused)")
+            if progress is not None:
+                progress.skip_stage(Stage.PDF, "cached PDF reused (PPTX unchanged)")
+            return "\n\n".join(logs), err
+
+        if progress is not None:
+            progress.start_stage(Stage.PDF, detail=f"Converting {slug}.pptx to PDF")
         p2 = subprocess.run(bun_x + [str(merge_pdf), str(deck_dir)], capture_output=True, text=True)
         logs.append("merge-to-pdf:\n" + (p2.stdout or "") + (p2.stderr or ""))
+        if p2.returncode == 0 and (deck_dir / f"{slug}.pdf").is_file():
+            write_pdf_cache(deck_dir, slug)
+            if progress is not None:
+                progress.end_stage(Stage.PDF, detail=f"{slug}.pdf written")
+        elif progress is not None:
+            progress.fail_stage(Stage.PDF, f"merge-to-pdf exited {p2.returncode}")
 
     return "\n\n".join(logs), err
 
@@ -782,7 +1240,7 @@ def list_deck_history() -> list[dict[str, Any]]:
         stat = d.stat()
         pdf = d / f"{slug}.pdf"
         pptx = d / f"{slug}.pptx"
-        pngs = list(d.glob("*.png"))
+        pngs = list_active_slide_files(d, ".png")
         items.append(
             {
                 "slug": slug,
@@ -829,20 +1287,36 @@ def run_pipeline(
     image_model: str,
     image_size: str,
     preset_names: list[str],
+    export_pdf: bool = True,
+    progress: ProgressBus | None = None,
 ) -> None:
     topic_slug = analysis["topic_slug"]
     deck_dir = get_session_deck_dir(topic_slug)
     ensure_dir(deck_dir)
 
+    if progress is not None:
+        progress.start_pipeline()
+        progress.start_stage(
+            Stage.SOURCE,
+            detail=f"Saving source, analysis, confirmation for `{topic_slug}`",
+        )
+
     # Persist refs + confirmation every pipeline run (mirrors skill bookkeeping)
     ensure_dir(deck_dir / "refs")
-    backup_if_exists(deck_dir / "confirmation.yaml")
-    (deck_dir / "confirmation.yaml").write_text(
+    write_text_if_changed(
+        deck_dir / "confirmation.yaml",
         yaml.safe_dump({"params": confirmed_params, "refs": ref_files_meta}, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
     )
 
+    if progress is not None:
+        progress.end_stage(Stage.SOURCE, detail="confirmation.yaml saved")
+
     # Step 3: outline
+    if progress is not None:
+        progress.start_stage(
+            Stage.OUTLINE,
+            detail=f"Generating {confirmed_params['slides']}-slide outline via {planning_model}",
+        )
     outline_template = read_ref_text("outline-template.md")
     presets_map = read_ref_text("dimensions/presets.md")
     style_spec = (
@@ -875,6 +1349,11 @@ always image slides.
 If preset is chosen, use the preset spec as authoritative. If custom dimensions, use:
 {confirmed_params.get('dimensions')}
 
+If the preset spec contains an "SVG Layout Guidance" section, use those SVG
+page roles as composition references only. Do not require native SVG template
+editing or rendering; image slides and chart slides must continue using the
+current skilldeck pipeline.
+
 Outline Template:
 {outline_template}
 
@@ -896,22 +1375,50 @@ Source content:
         expected_slides=int(confirmed_params["slides"]),
         max_attempts=3,
     )
-    backup_if_exists(deck_dir / "outline.md")
-    (deck_dir / "outline.md").write_text(str(md), encoding="utf-8")
-
-    # Step 5: prompts
-    outline_md = (deck_dir / "outline.md").read_text(encoding="utf-8")
-    write_prompt_files(deck_dir=deck_dir, outline_md=outline_md)
+    write_text_if_changed(deck_dir / "outline.md", str(md))
+    if progress is not None:
+        progress.end_stage(Stage.OUTLINE, detail="outline.md validated")
 
     # Step 5: prompts (image .md and/or chart .chart.json)
+    if progress is not None:
+        progress.start_stage(Stage.PROMPTS, detail="Splitting outline into per-slide prompts")
     outline_md = (deck_dir / "outline.md").read_text(encoding="utf-8")
     write_prompt_files(deck_dir=deck_dir, outline_md=outline_md)
+    if progress is not None:
+        n_image_prompts = len(list_active_slide_files(deck_dir / "prompts", ".md"))
+        n_chart_specs = len(list_active_slide_files(deck_dir / "prompts", ".chart.json"))
+        progress.end_stage(
+            Stage.PROMPTS,
+            detail=f"{n_image_prompts} image prompts, {n_chart_specs} chart specs",
+        )
+
+    # Step 5.5: visual concepts (Stage 4 — creative-director per-slide).
+    # Sequential per slide. Skips chart slides. Cached on disk by outline_hash.
+    style_for_concepts = style_spec or parse_style_instructions(outline_md)
+    style_preset_name = confirmed_params.get("style") or "blueprint"
+    generate_concepts(
+        deck_dir=deck_dir,
+        outline_md=outline_md,
+        style_spec=style_for_concepts,
+        style_preset_name=str(style_preset_name),
+        planning_base_url=planning_base_url,
+        planning_api_key=planning_api_key,
+        planning_model=planning_model,
+        planning_max_tokens=planning_max_tokens,
+        progress=progress,
+    )
+
+    # After concepts exist, rewrite each image prompt to template the concept
+    # block + style anchor (replaces the old <STYLE_INSTRUCTIONS> + // VISUAL
+    # prose dump). For slides without a concept.json (e.g. chart slides or
+    # if Stage 4 was skipped), the original prompt body stays.
+    rewrite_image_prompts_with_concepts(deck_dir=deck_dir, outline_md=outline_md)
 
     # Step 6: render chart slides (CHART_SPEC → SVG); skipped if no chart specs.
-    n_charts = render_chart_slides(deck_dir=deck_dir)
+    n_charts = render_chart_slides(deck_dir=deck_dir, progress=progress)
 
     # Step 7: images for prompt .md files. Chart slides have no .md, so they're skipped.
-    has_image_prompts = any((deck_dir / "prompts").glob("*.md"))
+    has_image_prompts = bool(list_active_slide_files(deck_dir / "prompts", ".md"))
     if has_image_prompts:
         generate_images_from_prompts(
             deck_dir=deck_dir,
@@ -919,12 +1426,17 @@ Source content:
             image_api_key=image_api_key,
             image_model=image_model,
             image_size=image_size,
+            progress=progress,
         )
+    elif progress is not None:
+        progress.skip_stage(Stage.IMAGES, "no image prompts")
 
     # Step 8: assemble final deck (image-side via editable_pptx, chart-side via svg_to_pptx, merged)
-    merge_log, merge_err = merge_deck(deck_dir=deck_dir)
+    merge_log, merge_err = merge_deck(deck_dir=deck_dir, export_pdf=export_pdf, progress=progress)
     if merge_err:
         st.warning(merge_err)
+        if progress is not None:
+            progress.mark_error(merge_err)
     elif (deck_dir / f"{deck_dir.name}.pptx").is_file():
         kind_summary = []
         if has_image_prompts:
@@ -933,6 +1445,10 @@ Source content:
             kind_summary.append(f"{n_charts} chart")
         kind_str = " + ".join(kind_summary) or "image"
         st.success(f"Exported **editable** `.pptx` ({kind_str} slides; open in PowerPoint to edit).")
+        if progress is not None:
+            progress.mark_done()
+    elif progress is not None:
+        progress.mark_done()
     if merge_log.strip():
         st.expander("Editable PPTX + PDF export log").code(merge_log, language="text")
 
@@ -1194,6 +1710,57 @@ def _step_rail(active_idx: int, done_until: int = -1) -> None:
         )
     parts.append("</div>")
     st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def _render_pipeline_timeline(snap) -> None:
+    """Render the live timeline + recent event log from a ProgressBus snapshot.
+
+    Called every autorefresh tick while the pipeline is running, plus once
+    after it finishes. The snapshot is plain data (no Streamlit objects),
+    so this is safe from any thread.
+    """
+    state_class = {
+        "queued": "",        # plain dot
+        "running": "active",
+        "done": "done",
+        "skipped": "done",   # show as solid green; detail explains it
+        "error": "bad",
+    }
+    rows_html: list[str] = ['<div class="sd-timeline">']
+    for stage in Stage:
+        info = snap.stages[stage]
+        cls = state_class.get(info.state, "queued")
+        title = info.label or stage.display
+        detail = info.detail or ""
+        if info.state == "skipped" and not detail:
+            detail = "skipped"
+        elif info.items_total and info.state in ("running", "done"):
+            detail = f"{detail} — {info.items_done}/{info.items_total}".strip(" —")
+        runtime = info.runtime
+        if info.state == "running":
+            runtime = runtime or "…"
+        elif info.state == "queued":
+            runtime = "queued"
+        elif info.state == "skipped":
+            runtime = runtime or "—"
+        rows_html.append(
+            f'<div class="sd-trow"><span class="sd-dot {cls}"></span>'
+            f'<div><strong>{title}</strong><span class="sub">{detail}</span></div>'
+            f'<span class="sd-runtime">{runtime}</span></div>'
+        )
+    rows_html.append("</div>")
+    st.markdown("".join(rows_html), unsafe_allow_html=True)
+
+    if snap.events:
+        # Show the last ~12 events under the timeline so users see live signals.
+        tail = snap.events[-12:]
+        log_lines = []
+        for ev in tail:
+            ts = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
+            stage_tag = f"[{ev.stage.value}] " if ev.stage is not None else ""
+            log_lines.append(f"{ts} {stage_tag}{ev.text}")
+        st.expander(f"Pipeline log ({len(snap.events)} event{'s' if len(snap.events) != 1 else ''})") \
+          .code("\n".join(log_lines), language="text")
 
 
 def _format_history_short(h: dict[str, Any]) -> str:
@@ -1577,6 +2144,22 @@ with col_cfg_l:
         unsafe_allow_html=True,
     )
 
+    # Export options
+    export_pdf_default = (os.getenv("SKILLDECK_EXPORT_PDF", "1") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    export_pdf = st.checkbox(
+        "Also export PDF",
+        value=export_pdf_default,
+        key="export_pdf",
+        help=(
+            "PDF runs after the editable PPTX is written. Skipping it makes "
+            "long runs return faster; you can always re-run export later. "
+            "Default comes from SKILLDECK_EXPORT_PDF (currently "
+            f"{'on' if export_pdf_default else 'off'})."
+        ),
+    )
+
     # Visual style cards + native preset list
     st.markdown(
         '<div style="display:flex;align-items:center;justify-content:space-between;'
@@ -1620,7 +2203,15 @@ with col_cfg_l:
         options=style_options,
         index=default_style_idx,
         key="style_choice",
-        help="All presets from skill/references/styles/. Pick custom-dimensions to use the four sliders below.",
+        format_func=lambda name: (
+            "custom-dimensions"
+            if name == "custom-dimensions"
+            else format_style_preset_label(str(name), presets)
+        ),
+        help=(
+            "Unified presets from skill/references/styles/. Some entries are backed by "
+            "skill/templates/layouts SVG packs and use those SVGs as prompt guidance."
+        ),
     )
 
     dims = None
@@ -1689,7 +2280,7 @@ with col_cfg_r:
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 confirm_col1, confirm_col2 = st.columns([3, 1])
 with confirm_col2:
-    confirm_run = st.button("Confirm & generate", type="primary", key="confirm_run", use_container_width=True)
+    confirm_run = st.button("Confirm & generate", type="primary", key="confirm_run", width="stretch")
 with confirm_col1:
     st.caption(
         "Hard gate: outline → prompts → images/charts → editable PPTX runs only after confirmation. "
@@ -1778,10 +2369,10 @@ def _read_timeline_state(d: Path) -> list[tuple[str, str, str, str]]:
     has_analysis = (d / "analysis.md").exists()
     has_outline = (d / "outline.md").exists()
     prompt_dir = d / "prompts"
-    n_prompts = len(list(prompt_dir.glob("*.md"))) if prompt_dir.exists() else 0
-    n_charts_spec = len(list(prompt_dir.glob("*.chart.json"))) if prompt_dir.exists() else 0
-    n_chart_svg = len(list(d.glob("[0-9][0-9]-slide-*.svg")))
-    n_pngs = len(list(d.glob("[0-9][0-9]-slide-*.png")))
+    n_prompts = len(list_active_slide_files(prompt_dir, ".md")) if prompt_dir.exists() else 0
+    n_charts_spec = len(list_active_slide_files(prompt_dir, ".chart.json")) if prompt_dir.exists() else 0
+    n_chart_svg = len(list_active_slide_files(d, ".svg"))
+    n_pngs = len(list_active_slide_files(d, ".png"))
     has_pptx = (d / f"{d.name}.pptx").exists()
 
     def state(done: bool, started: bool = False) -> str:
@@ -1852,19 +2443,24 @@ with col_gen_l:
     )
     st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
 
-    rows = _read_timeline_state(deck_dir)
-    timeline_html: list[str] = ['<div class="sd-timeline">']
-    for state, title, sub, runtime in rows:
-        timeline_html.append(
-            f'<div class="sd-trow"><span class="sd-dot {state}"></span>'
-            f'<div><strong>{title}</strong><span class="sub">{sub}</span></div>'
-            f'<span class="sd-runtime">{runtime}</span></div>'
-        )
-    timeline_html.append("</div>")
-    st.markdown("".join(timeline_html), unsafe_allow_html=True)
+    # If a live progress bus exists for the current sig, the timeline is rendered
+    # below in the run-pipeline block (after the worker is spawned). Skip the
+    # filesystem-polled fallback in that case to avoid double rendering.
+    live_bus = st.session_state.get(f"pipeline_bus::{sig}")
+    if live_bus is None:
+        rows = _read_timeline_state(deck_dir)
+        timeline_html: list[str] = ['<div class="sd-timeline">']
+        for state, title, sub, runtime in rows:
+            timeline_html.append(
+                f'<div class="sd-trow"><span class="sd-dot {state}"></span>'
+                f'<div><strong>{title}</strong><span class="sub">{sub}</span></div>'
+                f'<span class="sd-runtime">{runtime}</span></div>'
+            )
+        timeline_html.append("</div>")
+        st.markdown("".join(timeline_html), unsafe_allow_html=True)
 
     # Recovery card — visible whenever a deck folder has any partial output.
-    has_any_output = any(deck_dir.glob("[0-9][0-9]-slide-*.png")) or any(deck_dir.glob("[0-9][0-9]-slide-*.svg"))
+    has_any_output = bool(list_active_slide_files(deck_dir, ".png")) or bool(list_active_slide_files(deck_dir, ".svg"))
     if has_any_output and not (deck_dir / f"{topic_slug}.pptx").exists():
         st.markdown(
             """
@@ -1877,10 +2473,10 @@ with col_gen_l:
         )
         rc1, rc2 = st.columns([1, 1])
         with rc1:
-            if st.button("Re-run export only (PPTX + PDF)", key="recovery_export", use_container_width=True):
+            if st.button("Re-run export only (PPTX + PDF)", key="recovery_export", width="stretch"):
                 with st.status("Re-running export…", expanded=True) as export_status:
                     export_status.write("Starting editable PPTX and PDF merge…")
-                    retry_log, retry_err = merge_deck(deck_dir=deck_dir)
+                    retry_log, retry_err = merge_deck(deck_dir=deck_dir, export_pdf=export_pdf)
                     export_status.code(retry_log or "(no log)", language="text")
                 if retry_err:
                     st.warning(retry_err)
@@ -1888,7 +2484,7 @@ with col_gen_l:
                     st.success("Export finished — editable PPTX updated.")
                 st.rerun()
         with rc2:
-            if st.button("Restart full pipeline", key="recovery_restart", use_container_width=True):
+            if st.button("Restart full pipeline", key="recovery_restart", width="stretch"):
                 st.session_state.last_pipeline_sig = ""
                 st.session_state.last_pipeline_error = ""
                 st.rerun()
@@ -1913,7 +2509,7 @@ with col_gen_r:
         ))
     if last_err:
         cards.append(("Last run error", "See message", last_err[:240]))
-    if not last_err and not pptx_present and any(deck_dir.glob("[0-9][0-9]-slide-*.png")):
+    if not last_err and not pptx_present and list_active_slide_files(deck_dir, ".png"):
         cards.append((
             "PDF viewer unavailable", "Download still works",
             "No iframe dependency in the main success state.",
@@ -1941,35 +2537,95 @@ with col_gen_r:
 if st.session_state.approved_sig != sig:
     st.info("Edit settings above, then click **Confirm & generate** to start the pipeline.")
 elif sig != st.session_state.last_pipeline_sig:
+    # Background-thread runner with autorefresh polling. The progress bus is
+    # the source of truth for the timeline; the worker thread updates it,
+    # the main Streamlit script reads it once per autorefresh tick.
+    import threading
+    from streamlit.runtime.scriptrunner import add_script_run_ctx
     try:
-        with st.status("Running skilldeck pipeline…", expanded=True) as status:
-            status.write("Step 3: generating outline…")
-            run_pipeline(
-                source_text=combined_source,
-                topic_hint=topic_hint,
-                analysis=analysis,
-                confirmed_params=confirmed_params,
-                ref_files_meta=refs_meta,
-                planning_base_url=planning_base_url,
-                planning_api_key=planning_api_key,
-                planning_model=planning_model,
-                planning_max_tokens=planning_max_tokens,
-                image_base_url=image_base_url,
-                image_api_key=image_api_key,
-                image_model=image_model,
-                image_size=confirmed_params.get("image_size") or image_size_env,
-                preset_names=preset_names,
-            )
-            status.write("Done.")
-        st.session_state.last_pipeline_sig = sig
-        st.session_state.last_pipeline_error = ""
-        st.session_state._done_until = max(st.session_state._done_until, 2)
-        st.session_state._active_step = 3
-        st.rerun()
-    except Exception as e:
-        st.session_state.last_pipeline_error = str(e)
-        st.error(str(e))
-        st.stop()
+        from streamlit_autorefresh import st_autorefresh
+    except Exception:  # pragma: no cover - optional dep
+        st_autorefresh = None
+
+    bus_state_key = f"pipeline_bus::{sig}"
+    thread_state_key = f"pipeline_thread::{sig}"
+    error_state_key = f"pipeline_error::{sig}"
+
+    bus: ProgressBus | None = st.session_state.get(bus_state_key)
+    worker: threading.Thread | None = st.session_state.get(thread_state_key)
+
+    if bus is None:
+        bus = ProgressBus()
+        st.session_state[bus_state_key] = bus
+
+        # Capture variables needed inside the worker; nothing on `st.session_state`
+        # should be touched from the worker thread.
+        worker_args = dict(
+            source_text=combined_source,
+            topic_hint=topic_hint,
+            analysis=analysis,
+            confirmed_params=confirmed_params,
+            ref_files_meta=refs_meta,
+            planning_base_url=planning_base_url,
+            planning_api_key=planning_api_key,
+            planning_model=planning_model,
+            planning_max_tokens=planning_max_tokens,
+            image_base_url=image_base_url,
+            image_api_key=image_api_key,
+            image_model=image_model,
+            image_size=confirmed_params.get("image_size") or image_size_env,
+            preset_names=preset_names,
+            export_pdf=export_pdf,
+            progress=bus,
+        )
+
+        def _run_pipeline_thread() -> None:
+            try:
+                run_pipeline(**worker_args)
+            except Exception as exc:  # noqa: BLE001 - surface to UI
+                bus.mark_error(str(exc))
+                st.session_state[error_state_key] = str(exc)
+
+        worker = threading.Thread(target=_run_pipeline_thread, daemon=True,
+                                   name=f"skilldeck-pipeline-{topic_slug}")
+        # Attach Streamlit's ScriptRunContext so st.write/st.warning calls
+        # inside the pipeline don't emit ScriptRunContext warnings.
+        add_script_run_ctx(worker)
+        worker.start()
+        st.session_state[thread_state_key] = worker
+
+    snap = bus.snapshot()
+    is_alive = worker.is_alive() if worker is not None else False
+    overall = snap.overall_state
+
+    # Render live timeline.
+    _render_pipeline_timeline(snap)
+
+    # Drive reruns while the worker is still going.
+    if is_alive and overall == "running":
+        if st_autorefresh is not None:
+            st_autorefresh(interval=1000, key=f"pipeline_autorefresh::{sig}")
+        else:
+            time.sleep(1.0)
+            st.rerun()
+    else:
+        # Terminal: clean up so the next sig change starts fresh.
+        last_err = st.session_state.get(error_state_key, "") or snap.error or ""
+        if last_err:
+            st.session_state.last_pipeline_error = last_err
+            st.error(last_err)
+            # leave the bus around so the user sees the failed timeline
+            st.stop()
+        else:
+            st.session_state.last_pipeline_sig = sig
+            st.session_state.last_pipeline_error = ""
+            st.session_state._done_until = max(st.session_state._done_until, 2)
+            st.session_state._active_step = 3
+            # Drop the bus / thread refs for the completed run.
+            st.session_state.pop(bus_state_key, None)
+            st.session_state.pop(thread_state_key, None)
+            st.session_state.pop(error_state_key, None)
+            st.rerun()
 else:
     st.session_state._done_until = max(st.session_state._done_until, 2)
     st.session_state._active_step = 3
@@ -1992,8 +2648,8 @@ else:
 
 pptx_path = output_deck_dir / f"{out_slug}.pptx"
 pdf_path = output_deck_dir / f"{out_slug}.pdf"
-images = sorted(output_deck_dir.glob("[0-9][0-9]-slide-*.png"))
-charts = sorted(output_deck_dir.glob("[0-9][0-9]-slide-*.svg"))
+images = list_active_slide_files(output_deck_dir, ".png")
+charts = list_active_slide_files(output_deck_dir, ".svg")
 slide_count_actual = len(images) + len(charts)
 
 col_rev_l, col_rev_r = st.columns([1.15, 0.85], gap="medium")
@@ -2032,7 +2688,7 @@ with col_rev_l:
                 p, kind = all_slides[idx]
                 with col:
                     try:
-                        st.image(str(p), use_container_width=True)
+                        st.image(str(p), width="stretch")
                     except Exception:
                         if kind == "SVG":
                             st.markdown(p.read_text(encoding="utf-8"), unsafe_allow_html=True)
@@ -2069,12 +2725,12 @@ with col_rev_l:
                 data=pptx_path.read_bytes(),
                 file_name=pptx_path.name,
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
                 key=f"dl_pptx_{out_slug}",
             )
         else:
-            st.button("PPTX not ready", disabled=True, use_container_width=True, key=f"dl_pptx_disabled_{out_slug}")
+            st.button("PPTX not ready", disabled=True, width="stretch", key=f"dl_pptx_disabled_{out_slug}")
     with dl_b:
         if pdf_path.exists():
             st.download_button(
@@ -2082,11 +2738,11 @@ with col_rev_l:
                 data=pdf_path.read_bytes(),
                 file_name=pdf_path.name,
                 mime="application/pdf",
-                use_container_width=True,
+                width="stretch",
                 key=f"dl_pdf_{out_slug}",
             )
         else:
-            st.button("PDF not ready", disabled=True, use_container_width=True, key=f"dl_pdf_disabled_{out_slug}")
+            st.button("PDF not ready", disabled=True, width="stretch", key=f"dl_pdf_disabled_{out_slug}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2122,11 +2778,11 @@ with col_rev_r:
             "Re-run export only (editable PPTX + PDF)",
             help="Runs `python -m editable_pptx` and PDF merge only.",
             key=f"retry_export_{out_slug}",
-            use_container_width=True,
+            width="stretch",
         ):
             with st.status("Re-running export…", expanded=True) as export_status:
                 export_status.write("Starting editable PPTX and PDF merge…")
-                retry_log, retry_err = merge_deck(deck_dir=output_deck_dir)
+                retry_log, retry_err = merge_deck(deck_dir=output_deck_dir, export_pdf=export_pdf)
                 export_status.code(retry_log or "(no log)", language="text")
             if retry_err:
                 st.warning(retry_err)
@@ -2174,6 +2830,5 @@ if pdf_path.exists():
 # Final state: if review has any output, mark step 4 done.
 if pptx_path.exists() or pdf_path.exists() or images or charts:
     st.session_state._done_until = max(st.session_state._done_until, 3)
-
 
 
