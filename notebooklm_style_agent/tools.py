@@ -10,7 +10,7 @@ from .refs import list_style_presets, load_style_preset_text
 def build_tools(skill_dir: Path):
     @tool
     def list_available_style_presets() -> list[str]:
-        """List built-in style preset names from baoyu-slide-deck references/styles/*.md."""
+        """List built-in style preset names from skill/references/styles/*.md."""
         return [p.name for p in list_style_presets(skill_dir)]
 
     @tool

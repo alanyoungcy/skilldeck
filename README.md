@@ -13,9 +13,9 @@ source text / PDF
                                     └─► flat PDF (optional)
 ```
 
-![Streamlit UI: paste text or upload a PDF, confirm, then run outline → prompts → images → export](docs/streamlit-app.png)
+![Streamlit UI: paste text or upload a PDF, confirm, then run outline to prompts, images, charts, and export](screenshot.jpg)
 
-The slide-design half (outline + image prompts) is driven by the [`baoyu-slide-deck`](https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-slide-deck/SKILL.md) skill — included here as a vendored copy under `baoyu-skills/`. The export half (`editable_pptx/`) is local and turns any PNG slide deck into a real `.pptx` with editable text, native preset shapes, and matched fonts.
+The slide-design half (outline + image prompts) was originally driven by the [`baoyu-slide-deck`](https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-slide-deck/SKILL.md) skill from JimLiu/baoyu-skills, vendored locally and renamed to `skill/`. The export half (`editable_pptx/`, `svg_to_pptx/`, `svg_finalize/`, `deck_assembler/`) is local. Narrative slides take the PNG → MinerU → editable PPTX path; chart slides take an SVG-template path; both kinds combine into one editable `.pptx`.
 
 ---
 
@@ -23,11 +23,14 @@ The slide-design half (outline + image prompts) is driven by the [`baoyu-slide-d
 
 | Path | Purpose |
 |---|---|
-| `streamlit_app.py` | Single-page Streamlit UI: text/PDF in → confirmation → outline → prompts → images → PPTX/PDF |
+| `streamlit_app.py` | Single-page Streamlit UI: text/PDF in → confirmation → outline → prompts → images/charts → PPTX/PDF |
 | `editable_pptx/` | Image/PDF → editable PPTX pipeline (MinerU layout + VLM style + shape detection + python-pptx) |
-| `baoyu-skills/skills/baoyu-slide-deck/` | Vendored copy of [JimLiu/baoyu-skills `baoyu-slide-deck`](https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-slide-deck/SKILL.md) — outline templates, layout gallery, style dimensions, base prompts |
+| `svg_to_pptx/` | SVG → native DrawingML PPTX exporter (ported from `ppt-master`) |
+| `svg_finalize/` | SVG post-processing — icon embedding, image cropping, tspan flattening, rect→path |
+| `deck_assembler/` | Mixed-pipeline merge: image-slide PPTXs + chart-slide PPTXs → single deck |
+| `skill/` | The skill folder: `SKILL.md`, `references/`, `scripts/`, `templates/` (charts, layouts, icons) |
 | `notebooklm_style_agent/` | LangChain agent for style extraction from reference images (experimental, not wired into the default flow) |
-| `slide-deck/` | Per-deck output folders: `<slug>/01-slide-*.png`, `outline.md`, `prompts/`, `<slug>.pptx`, `<slug>.pdf` |
+| `slide-deck/` | Per-deck output folders: `<slug>/01-slide-*.png` or `*.svg`, `outline.md`, `prompts/`, `<slug>.pptx`, `<slug>.pdf` |
 
 ---
 
@@ -45,7 +48,7 @@ The `editable_pptx` module reconstructs slide PNGs as native PowerPoint, in the 
    - either the original PNG as a masked background **or** a flat fill from the inferred page bg (`EDITABLE_PPTX_BG_FLATTEN=1`)
 6. **Optional crosscheck** — render the produced PPTX back to PNGs via LibreOffice and ask the VLM to score each slide vs the source, writing `crosscheck_report.json`.
 
-See [`baoyu-skills/skills/baoyu-slide-deck/references/editable-pptx.md`](baoyu-skills/skills/baoyu-slide-deck/references/editable-pptx.md) for the full env-var reference.
+See [`skill/references/editable-pptx.md`](skill/references/editable-pptx.md) for the full env-var reference.
 
 ---
 
@@ -141,18 +144,19 @@ When the planning LLM emits this block in a slide entry, `streamlit_app.write_pr
 </DESIGN_SPEC>
 ```
 
-Documented in `baoyu-skills/skills/baoyu-slide-deck/references/outline-template.md`.
+Documented in `skill/references/outline-template.md`.
 
 ---
 
 ## Credits
 
-- Outline + image-prompt half: vendored from [JimLiu/baoyu-skills · skills/baoyu-slide-deck](https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-slide-deck/SKILL.md). Layout gallery, style dimensions, content rules, and the planning prompts are all from upstream.
-- Editable PPTX, shape reconstruction, font matching, layout snap, and crosscheck are local to this repo (`editable_pptx/`).
+- Outline + image-prompt half: vendored from [JimLiu/baoyu-skills · skills/baoyu-slide-deck](https://github.com/JimLiu/baoyu-skills/blob/main/skills/baoyu-slide-deck/SKILL.md), renamed to `skill/`. Layout gallery, style dimensions, content rules, and the planning prompts are all from upstream.
+- SVG-chart half (`svg_to_pptx/`, `svg_finalize/`, `skill/templates/charts/`, `skill/templates/layouts/`, `skill/templates/icons/`) ported from the open-source `ppt-master` project.
+- Editable PPTX, shape reconstruction, font matching, layout snap, crosscheck, and the mixed-deck assembler (`deck_assembler/`) are local to this repo.
 - Inspired by **Codia AI NoteSlide** and the open-source `ppt-master` workflow — both convert slide bitmaps back into editable presentations rather than flattening them.
 
 ---
 
 ## License
 
-See upstream [`baoyu-skills`](https://github.com/JimLiu/baoyu-skills) for the vendored skill's license. Local code under `editable_pptx/`, `streamlit_app.py`, and `notebooklm_style_agent/` carries the repo's own license.
+See upstream [`baoyu-skills`](https://github.com/JimLiu/baoyu-skills) for the vendored skill's license, and upstream `ppt-master` for the SVG/charting half. Local code under `editable_pptx/`, `deck_assembler/`, `streamlit_app.py`, and `notebooklm_style_agent/` carries the repo's own license.

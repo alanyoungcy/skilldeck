@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from notebooklm_style_agent.refs import list_style_presets, load_style_preset_text
 
 REPO_DIR = Path(__file__).resolve().parent
-SKILL_DIR = REPO_DIR / "baoyu-skills" / "skills" / "baoyu-slide-deck"
+SKILL_DIR = REPO_DIR / "skill"
 DECKS_DIR = REPO_DIR / "slide-deck"
 
 
@@ -112,12 +112,11 @@ def ensure_dir(p: Path) -> None:
 
 def load_extend_md() -> tuple[Preferences, Path | None]:
     candidates = [
-        REPO_DIR / ".baoyu-skills" / "baoyu-slide-deck" / "EXTEND.md",
+        REPO_DIR / ".skilldeck" / "EXTEND.md",
         Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-        / "baoyu-skills"
-        / "baoyu-slide-deck"
+        / "skilldeck"
         / "EXTEND.md",
-        Path.home() / ".baoyu-skills" / "baoyu-slide-deck" / "EXTEND.md",
+        Path.home() / ".skilldeck" / "EXTEND.md",
     ]
     for p in candidates:
         if p.exists():
@@ -393,9 +392,21 @@ def _extract_design_spec(slide_block: str) -> dict | None:
     Used downstream by `editable_pptx` to hint shape detection and styling.
     Returns None if the block is missing or unparsable.
     """
+    return _extract_json_block(slide_block, "DESIGN_SPEC")
+
+
+def _extract_chart_spec(slide_block: str) -> dict | None:
+    """Optional <CHART_SPEC>...</CHART_SPEC> JSON block per slide.
+
+    When present, the slide is rendered as a programmatic SVG chart instead of an AI image.
+    """
+    return _extract_json_block(slide_block, "CHART_SPEC")
+
+
+def _extract_json_block(slide_block: str, tag: str) -> dict | None:
     import json as _json
 
-    m = re.search(r"<DESIGN_SPEC>([\s\S]*?)</DESIGN_SPEC>", slide_block)
+    m = re.search(rf"<{tag}>([\s\S]*?)</{tag}>", slide_block)
     if not m:
         return None
     body = m.group(1).strip()
@@ -411,6 +422,22 @@ def _extract_design_spec(slide_block: str) -> dict | None:
     return None
 
 
+def _slide_render_kind(slide_block: str) -> str:
+    """Return 'chart' if a CHART_SPEC block is present (or **Render**: chart line is set), else 'image'."""
+    if re.search(r"^\*\*Render\*\*:\s*chart\s*$", slide_block, re.MULTILINE | re.IGNORECASE):
+        return "chart"
+    if _extract_chart_spec(slide_block) is not None:
+        return "chart"
+    return "image"
+
+
+def _slide_filename(slide_block: str, fallback_ext: str = "png") -> str:
+    m = re.search(r"^\*\*Filename\*\*:\s*(.+)$", slide_block, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return f"{now_ts()}-slide.{fallback_ext}"
+
+
 def write_prompt_files(*, deck_dir: Path, outline_md: str) -> None:
     style_block = parse_style_instructions(outline_md)
     slides_blocks = parse_slides(outline_md)
@@ -421,8 +448,26 @@ def write_prompt_files(*, deck_dir: Path, outline_md: str) -> None:
     ensure_dir(deck_dir / "prompts")
 
     for sb in slides_blocks:
-        m = re.search(r"^\*\*Filename\*\*:\s*(.+)$", sb, re.MULTILINE)
-        filename = m.group(1).strip() if m else f"{now_ts()}-slide.png"
+        kind = _slide_render_kind(sb)
+        if kind == "chart":
+            chart_spec = _extract_chart_spec(sb)
+            if chart_spec is None:
+                # Fallback: malformed CHART_SPEC, treat as image so it at least renders.
+                kind = "image"
+
+        if kind == "chart":
+            filename = _slide_filename(sb, fallback_ext="svg")
+            stem = Path(filename).with_suffix("").name
+            chart_path = deck_dir / "prompts" / f"{stem}.chart.json"
+            backup_if_exists(chart_path)
+            import json as _json
+
+            chart_path.write_text(
+                _json.dumps(chart_spec, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            continue
+
+        filename = _slide_filename(sb, fallback_ext="png")
         stem = Path(filename).with_suffix("").name
         prompt_md_path = deck_dir / "prompts" / f"{stem}.md"
         backup_if_exists(prompt_md_path)
@@ -492,8 +537,8 @@ def validate_outline(outline_md: str, expected_slides: int) -> tuple[bool, str]:
         if not fm:
             return False, f"Slide {i} has malformed **Filename** line."
         fn = fm.group(1).strip().strip("`").strip()
-        if not re.match(r"^\d{2}-slide-.+\.(png|jpg|jpeg)$", fn, flags=re.IGNORECASE):
-            return False, f"Slide {i} filename must look like `NN-slide-slug.png` (got `{fn}`)."
+        if not re.match(r"^\d{2}-slide-.+\.(png|jpg|jpeg|svg)$", fn, flags=re.IGNORECASE):
+            return False, f"Slide {i} filename must look like `NN-slide-slug.png` (or `.svg` for chart slides) — got `{fn}`."
 
     return True, "ok"
 
@@ -519,7 +564,7 @@ def append_missing_slides(
             return md
 
         start_idx = have + 1
-        cont = f"""You are continuing an existing `outline.md` for baoyu-slide-deck.
+        cont = f"""You are continuing an existing `outline.md` for skilldeck.
 
 CRITICAL:
 - Output ONLY the remaining slide blocks.
@@ -600,6 +645,35 @@ def generate_outline_with_retry(
     )
 
 
+def render_chart_slides(*, deck_dir: Path) -> int:
+    """Render every prompts/*.chart.json into a sibling SVG in deck_dir.
+
+    Returns the number of charts rendered. Safe to call when no chart specs exist.
+    """
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    try:
+        from render_chart_slide import render_chart_svg  # type: ignore
+    finally:
+        # leave skill/scripts on the path (other helpers may rely on it later)
+        pass
+
+    chart_files = sorted((deck_dir / "prompts").glob("*.chart.json"))
+    rendered = 0
+    for cf in chart_files:
+        try:
+            spec = json.loads(cf.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"Bad chart spec in {cf.name}: {e}") from e
+        stem = cf.name[: -len(".chart.json")]
+        out_path = deck_dir / f"{stem}.svg"
+        backup_if_exists(out_path)
+        svg = render_chart_svg(spec)
+        out_path.write_text(svg, encoding="utf-8")
+        st.write(f"Rendered chart {rendered + 1}: `{out_path.name}` (template: {spec.get('template')})")
+        rendered += 1
+    return rendered
+
+
 def generate_images_from_prompts(
     *,
     deck_dir: Path,
@@ -635,32 +709,40 @@ def generate_images_from_prompts(
 
 
 def merge_deck(*, deck_dir: Path) -> tuple[str, str]:
-    """Build editable PPTX via `python -m editable_pptx`, then optional PDF via bun script."""
+    """Build editable PPTX via `python -m deck_assembler` (image + chart slides), then optional PDF via bun script."""
     bun_x = resolve_bun_x()
     logs: list[str] = []
     err = ""
 
-    if not os.getenv("MINERU_TOKEN", "").strip():
+    has_image_slides = any(re.match(r"^\d+-slide-.*\.(png|jpg|jpeg)$", p.name, re.IGNORECASE)
+                           for p in deck_dir.iterdir() if p.is_file())
+    has_chart_slides = any(re.match(r"^\d+-slide-.*\.svg$", p.name, re.IGNORECASE)
+                           for p in deck_dir.iterdir() if p.is_file())
+
+    if has_image_slides and not os.getenv("MINERU_TOKEN", "").strip():
         logs.append(
-            "editable_pptx: skipped — MINERU_TOKEN not set in `.env` "
-            "(add it next to PLANNING_* / IMAGE_*; see `.env.example`)."
+            "deck_assembler: skipped — image slides require MINERU_TOKEN (not set in `.env`). "
+            "Add it next to PLANNING_* / IMAGE_*; see `.env.example`."
         )
         err = (
             "Editable PPTX was skipped: set **MINERU_TOKEN** in `.env`. "
             "PDF export still runs below if `bun` is available."
         )
+    elif not (has_image_slides or has_chart_slides):
+        logs.append("deck_assembler: skipped — no slides found.")
+        err = "No slide artifacts to export."
     else:
         py = sys.executable
         r = subprocess.run(
-            [py, "-m", "editable_pptx", str(deck_dir)],
+            [py, "-m", "deck_assembler", str(deck_dir)],
             cwd=str(REPO_DIR),
             env=os.environ.copy(),
             capture_output=True,
             text=True,
         )
-        logs.append("editable_pptx:\n" + (r.stdout or "") + (r.stderr or ""))
+        logs.append("deck_assembler:\n" + (r.stdout or "") + (r.stderr or ""))
         if r.returncode != 0:
-            err = f"editable_pptx failed (exit {r.returncode}). Check log below; PDF may still have been built."
+            err = f"deck_assembler failed (exit {r.returncode}). Check log below; PDF may still have been built."
 
     if not bun_x:
         logs.append("merge-to-pdf: skipped (missing `bun` and `npx`)")
@@ -774,13 +856,21 @@ def run_pipeline(
         if n_slides == 1
         else f"- Exactly {n_slides} slides (Slide 1=Cover, last=Back Cover)"
     )
-    prompt = f"""Generate `outline.md` for the `baoyu-slide-deck` skill.
+    prompt = f"""Generate `outline.md` for the `skilldeck` skill.
 Follow the Outline Template exactly. Include:
 - Header metadata
 - <STYLE_INSTRUCTIONS> block (single source of truth)
 {slide_count_line}
 - Audience={confirmed_params['audience']}
 - Language={confirmed_params['language']} (auto => detected={analysis['detected_language']})
+
+When the source contains numeric data — KPIs, time series, comparisons,
+tables, before/after, percentages — emit a chart slide using the
+`<CHART_SPEC>` block (see Outline Template). Chart slides bypass image
+generation entirely and export as native editable shapes. Use chart slides
+liberally for any quantitative content. Use image slides for narrative,
+metaphors, hero shots, and anything not numeric. Cover and back-cover are
+always image slides.
 
 If preset is chosen, use the preset spec as authoritative. If custom dimensions, use:
 {confirmed_params.get('dimensions')}
@@ -813,37 +903,314 @@ Source content:
     outline_md = (deck_dir / "outline.md").read_text(encoding="utf-8")
     write_prompt_files(deck_dir=deck_dir, outline_md=outline_md)
 
-    # Step 7: images
-    generate_images_from_prompts(
-        deck_dir=deck_dir,
-        image_base_url=image_base_url,
-        image_api_key=image_api_key,
-        image_model=image_model,
-        image_size=image_size,
-    )
+    # Step 5: prompts (image .md and/or chart .chart.json)
+    outline_md = (deck_dir / "outline.md").read_text(encoding="utf-8")
+    write_prompt_files(deck_dir=deck_dir, outline_md=outline_md)
 
-    # Step 8: editable PPTX (MinerU) + optional PDF
+    # Step 6: render chart slides (CHART_SPEC → SVG); skipped if no chart specs.
+    n_charts = render_chart_slides(deck_dir=deck_dir)
+
+    # Step 7: images for prompt .md files. Chart slides have no .md, so they're skipped.
+    has_image_prompts = any((deck_dir / "prompts").glob("*.md"))
+    if has_image_prompts:
+        generate_images_from_prompts(
+            deck_dir=deck_dir,
+            image_base_url=image_base_url,
+            image_api_key=image_api_key,
+            image_model=image_model,
+            image_size=image_size,
+        )
+
+    # Step 8: assemble final deck (image-side via editable_pptx, chart-side via svg_to_pptx, merged)
     merge_log, merge_err = merge_deck(deck_dir=deck_dir)
     if merge_err:
         st.warning(merge_err)
     elif (deck_dir / f"{deck_dir.name}.pptx").is_file():
-        st.success("Exported **editable** `.pptx` (open in PowerPoint to edit text).")
+        kind_summary = []
+        if has_image_prompts:
+            kind_summary.append("image")
+        if n_charts:
+            kind_summary.append(f"{n_charts} chart")
+        kind_str = " + ".join(kind_summary) or "image"
+        st.success(f"Exported **editable** `.pptx` ({kind_str} slides; open in PowerPoint to edit).")
     if merge_log.strip():
         st.expander("Editable PPTX + PDF export log").code(merge_log, language="text")
 
 
-# --- Streamlit UI ---
+# --- Streamlit UI (cockpit layout) ---
 
-st.set_page_config(page_title="baoyu-slide-deck", layout="wide")
+IMAGE_MODEL_CHOICES = ["gpt-image-2-cheap", "gpt-image-2", "nano-banana-pro"]
+
+
+def _resolve_default_image_model(env_value: str) -> str:
+    v = (env_value or "").strip()
+    if v in IMAGE_MODEL_CHOICES:
+        return v
+    # If env points to a non-listed model, prepend it so the user keeps their override.
+    return v if v else IMAGE_MODEL_CHOICES[1]
+
+
+def _inject_theme_css() -> None:
+    st.markdown(
+        """
+<style id="skilldeck-theme">
+:root {
+  --bg:      oklch(99% 0.002 240);
+  --surface: oklch(100% 0 0);
+  --fg:      oklch(18% 0.012 250);
+  --muted:   oklch(54% 0.012 250);
+  --border:  oklch(92% 0.005 250);
+  --accent:  oklch(58% 0.18 255);
+  --radius: 8px;
+}
+html, body, .main, .block-container { background: var(--bg); color: var(--fg); }
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px; }
+section[data-testid="stSidebar"] {
+  background: oklch(100% 0 0 / 0.92);
+  border-right: 1px solid var(--border);
+  backdrop-filter: blur(18px);
+}
+section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+
+/* topbar */
+.sd-topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 18px; margin-bottom: 14px;
+  background: oklch(99% 0.002 240 / 0.88);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.sd-topbar h2 { margin: 0; font-size: 22px; letter-spacing: 0; }
+.sd-topbar p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+.sd-topbar .actions { display: flex; gap: 8px; }
+.sd-topbar .actions span {
+  border: 1px solid var(--border); border-radius: 7px; padding: 6px 11px;
+  font-size: 12px; color: var(--muted); background: var(--surface);
+}
+
+/* status rail */
+.sd-rail { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+.sd-step {
+  display: grid; grid-template-columns: 26px 1fr; align-items: center; gap: 9px;
+  border: 1px solid var(--border); background: var(--surface);
+  border-radius: var(--radius); padding: 10px;
+}
+.sd-step .num {
+  width: 26px; height: 26px; border-radius: 999px; display: grid; place-items: center;
+  color: var(--muted); border: 1px solid var(--border);
+  font: 700 12px/1 ui-monospace, "JetBrains Mono", Menlo, monospace;
+}
+.sd-step strong { display: block; line-height: 1.1; font-size: 13px; }
+.sd-step span.sub { color: var(--muted); font-size: 12px; }
+.sd-step.active { border-color: oklch(78% 0.04 255); box-shadow: inset 0 -3px 0 var(--accent); }
+.sd-step.active .num { color: white; border-color: var(--accent); background: var(--accent); }
+.sd-step.done .num { color: white; border-color: oklch(61% 0.14 145); background: oklch(61% 0.14 145); }
+
+/* panels (wraps a Streamlit container) */
+.sd-panel-head {
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 14px 16px;
+  background: var(--surface);
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
+}
+.sd-panel-head .label {
+  color: var(--muted);
+  font: 700 11px/1 ui-monospace, "JetBrains Mono", Menlo, monospace;
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.sd-panel-head h3 { margin: 4px 0 0; font-size: 15px; }
+.sd-panel-head p  { margin: 3px 0 0; color: var(--muted); font-size: 12px; max-width: 64ch; }
+.sd-panel-body {
+  border: 1px solid var(--border);
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: var(--surface);
+  padding: 14px 16px;
+}
+
+/* badges */
+.sd-badge {
+  display: inline-flex; align-items: center; gap: 5px; height: 22px;
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 8px;
+  color: var(--muted); background: oklch(99% 0.002 240);
+  font: 600 11px/1 ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: nowrap;
+}
+.sd-badge.good { color: oklch(43% 0.12 145); border-color: oklch(85% 0.05 145); }
+.sd-badge.warn { color: oklch(55% 0.14 70);  border-color: oklch(84% 0.08 70); }
+.sd-badge.bad  { color: oklch(51% 0.19 28);  border-color: oklch(86% 0.045 28); }
+
+/* metric cards */
+.sd-metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.sd-metric {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px; background: oklch(99% 0.002 240);
+}
+.sd-metric small { display: block; color: var(--muted); font-weight: 650; font-size: 12px; }
+.sd-metric strong {
+  display: block; margin-top: 6px;
+  font: 760 22px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+/* recommendation */
+.sd-reco {
+  margin-top: 12px; border: 1px solid oklch(85% 0.04 255); border-radius: var(--radius);
+  padding: 13px; background: oklch(97% 0.018 255);
+}
+.sd-reco strong { display: block; }
+.sd-reco p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+
+/* style cards */
+.sd-style-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 12px; min-height: 110px;
+  display: flex; flex-direction: column; justify-content: space-between; gap: 10px;
+}
+.sd-style-card.active { border-color: oklch(76% 0.05 255); box-shadow: inset 0 0 0 1px oklch(76% 0.05 255); }
+.sd-swatches { display: flex; gap: 4px; }
+.sd-swatch { height: 18px; flex: 1; border-radius: 4px; border: 1px solid oklch(18% 0.012 250 / 0.1); }
+.sd-style-card h4 { margin: 0; font-size: 13px; }
+.sd-style-card p  { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+
+/* timeline */
+.sd-timeline {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); overflow: hidden; margin-top: 4px;
+}
+.sd-trow {
+  display: grid; grid-template-columns: 30px 1fr auto;
+  gap: 12px; align-items: center; padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.sd-trow:last-child { border-bottom: 0; }
+.sd-dot {
+  width: 18px; height: 18px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface);
+}
+.sd-dot.done { background: oklch(61% 0.14 145); border-color: oklch(61% 0.14 145); }
+.sd-dot.active { border-color: var(--accent); box-shadow: 0 0 0 5px oklch(58% 0.18 255 / 0.14); }
+.sd-dot.warn { background: oklch(70% 0.15 70); border-color: oklch(70% 0.15 70); }
+.sd-dot.bad  { background: oklch(64% 0.18 28); border-color: oklch(64% 0.18 28); }
+.sd-trow strong { display: block; font-size: 13px; }
+.sd-trow span.sub { color: var(--muted); font-size: 12px; }
+.sd-runtime {
+  font: 12px/1 ui-monospace, "JetBrains Mono", Menlo, monospace;
+  color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+/* recovery callout */
+.sd-recovery {
+  margin-top: 14px; border: 1px solid oklch(84% 0.08 70); border-radius: var(--radius);
+  background: oklch(98% 0.025 80); padding: 14px;
+}
+.sd-recovery h4 {
+  margin: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: 14px;
+}
+.sd-recovery p { color: var(--muted); margin: 8px 0 0; font-size: 12px; }
+
+/* deck library cards inside sidebar */
+.sd-deck {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 10px; margin-bottom: 8px;
+}
+.sd-deck.active { border-color: oklch(76% 0.05 255); box-shadow: inset 3px 0 0 var(--accent); }
+.sd-deck .row {
+  display: flex; justify-content: space-between; gap: 8px; font-weight: 650; font-size: 13px;
+}
+.sd-deck .meta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* download cards */
+.sd-dl-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 12px; }
+.sd-dl-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 13px; background: oklch(99% 0.002 240);
+}
+.sd-dl-card strong { display: block; }
+.sd-dl-card p { margin: 5px 0 10px; color: var(--muted); font-size: 12px; }
+
+/* slide gallery thumbs */
+.sd-thumb {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); overflow: hidden;
+}
+.sd-thumb .cap {
+  padding: 8px 10px; display: flex; justify-content: space-between;
+  gap: 6px; font-size: 12px; border-top: 1px solid var(--border);
+}
+
+/* misc */
+hr { border: 0; border-top: 1px solid var(--border); margin: 18px 0; }
+div[data-testid="stTextInput"] input,
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stNumberInput"] input,
+div[data-baseweb="select"] > div {
+  border-radius: 7px !important;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def _panel_head(label: str, title: str, sub: str = "", badge: str | None = None, badge_kind: str = "") -> None:
+    badge_html = ""
+    if badge:
+        cls = f"sd-badge {badge_kind}".strip()
+        badge_html = f'<span class="{cls}">{badge}</span>'
+    sub_html = f"<p>{sub}</p>" if sub else ""
+    st.markdown(
+        f"""
+<div class="sd-panel-head">
+  <div>
+    <span class="label">{label}</span>
+    <h3>{title}</h3>
+    {sub_html}
+  </div>
+  {badge_html}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def _step_rail(active_idx: int, done_until: int = -1) -> None:
+    steps = [
+        ("1", "Create Deck", "source and analysis"),
+        ("2", "Configure",   "style and outputs"),
+        ("3", "Generate",    "resumable pipeline"),
+        ("4", "Review",      "preview and download"),
+    ]
+    parts: list[str] = ['<div class="sd-rail">']
+    for i, (num, title, sub) in enumerate(steps):
+        cls = "sd-step"
+        if i <= done_until:
+            cls += " done"
+        if i == active_idx:
+            cls += " active"
+        parts.append(
+            f'<div class="{cls}"><span class="num">{num}</span>'
+            f'<span><strong>{title}</strong><span class="sub">{sub}</span></span></div>'
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def _format_history_short(h: dict[str, Any]) -> str:
+    ts = datetime.fromtimestamp(h["mtime"])
+    today = datetime.now().date()
+    if ts.date() == today:
+        return ts.strftime("%H:%M")
+    if (today - ts.date()).days == 1:
+        return "Yesterday"
+    return ts.strftime("%b %d")
+
+
+# Page setup
+st.set_page_config(page_title="skilldeck", layout="wide", initial_sidebar_state="expanded")
 _dotenv_path = REPO_DIR / ".env"
 load_dotenv_robust(_dotenv_path)
-
-st.title("Slide Deck Generator")
-st.caption(
-    "Runs the `baoyu-slide-deck` flow end-to-end: analyze → confirm → outline → prompts → images → export. "
-    "**PowerPoint** is an **editable** `.pptx` (MinerU layout + live text), not a flat slide-deck image export. "
-    "Set **MINERU_TOKEN** in `.env`. Only edit **source** + **confirmation**; the rest runs automatically."
-)
+_inject_theme_css()
 
 if not SKILL_DIR.exists():
     st.error(f"Missing skill directory: {SKILL_DIR}")
@@ -855,7 +1222,7 @@ prefs, prefs_path = load_extend_md()
 presets = list_style_presets(SKILL_DIR)
 preset_names = [p.name for p in presets]
 if not preset_names:
-    st.error("No style presets found under `baoyu-slide-deck/references/styles/*.md`.")
+    st.error("No style presets found under `skill/references/styles/*.md`.")
     st.stop()
 
 default_preset = _get(cfg, "inputs.default_style_preset", prefs.style or preset_names[0])
@@ -867,35 +1234,93 @@ planning_api_key = env_default("PLANNING_API_KEY").strip()
 planning_model = env_default("PLANNING_MODEL").strip()
 image_base_url = env_default("IMAGE_BASE_URL").strip()
 image_api_key = env_default("IMAGE_API_KEY").strip()
-image_model = env_default("IMAGE_MODEL").strip()
+image_model_env = env_default("IMAGE_MODEL").strip()
 planning_max_tokens = int(env_default("PLANNING_MAX_TOKENS", "8000") or "8000")
-image_size = normalize_image_size(env_default("IMAGE_SIZE", "1920x1080"))
+image_size_env = normalize_image_size(env_default("IMAGE_SIZE", "1920x1080"))
 
 histories = list_deck_history()
 _HISTORY_CURRENT = "__current__"
 
+# ------------------------------- Sidebar (deck library) ----------------------
 with st.sidebar:
+    st.markdown(
+        """
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px">
+  <div style="display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:center">
+    <div style="width:28px;height:28px;border:1px solid var(--fg);border-radius:6px;display:grid;place-items:center;
+                font:700 12px/1 ui-monospace,Menlo,monospace;background:var(--surface)">SD</div>
+    <div>
+      <div style="font-weight:700;font-size:15px;line-height:1.1">skilldeck</div>
+      <div style="color:var(--muted);font-size:12px">Editable AI deck cockpit</div>
+    </div>
+  </div>
+  <span class="sd-badge good">ready</span>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
     if prefs_path:
         st.caption(f"EXTEND.md: `{prefs_path}`")
-        st.divider()
-    st.subheader("Deck history")
+
+    st.markdown('<span style="color:var(--muted);font:700 11px/1 ui-monospace,Menlo,monospace;'
+                'letter-spacing:.06em;text-transform:uppercase">Deck library</span>',
+                unsafe_allow_html=True)
+
     if histories:
         preview_options = [_HISTORY_CURRENT] + [h["slug"] for h in histories]
         preview_pick = st.selectbox(
             "Preview outputs from",
             options=preview_options,
-            format_func=lambda s: "Current session (source below)"
+            format_func=lambda s: "Current session"
             if s == _HISTORY_CURRENT
             else format_deck_history_row(histories, s),
             key="deck_history_pick",
+            label_visibility="collapsed",
         )
         st.session_state["_preview_deck_slug"] = None if preview_pick == _HISTORY_CURRENT else preview_pick
+
+        # Render the top 6 most recent decks as styled cards
+        for h in histories[:6]:
+            slug = h["slug"]
+            short = slug if len(slug) <= 28 else slug[:26] + "…"
+            when = _format_history_short(h)
+            badges: list[str] = []
+            if h["has_pptx"]:
+                badges.append('<span class="sd-badge good">PPTX</span>')
+            if h["has_pdf"]:
+                badges.append('<span class="sd-badge good">PDF</span>')
+            elif h["has_pptx"]:
+                badges.append('<span class="sd-badge warn">PDF missing</span>')
+            if h["png_count"]:
+                badges.append(f'<span class="sd-badge">{h["png_count"]} PNG</span>')
+            if not h["has_pptx"] and not h["has_pdf"] and not h["png_count"]:
+                badges.append('<span class="sd-badge bad">empty</span>')
+            active = " active" if slug == st.session_state.get("_preview_deck_slug") else ""
+            st.markdown(
+                f"""
+<div class="sd-deck{active}">
+  <div class="row"><span>{short}</span><span class="sd-runtime">{when}</span></div>
+  <div class="meta">{''.join(badges)}</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
     else:
         st.caption("No decks in `slide-deck/` yet.")
         st.session_state["_preview_deck_slug"] = None
 
+    st.markdown(
+        '<div style="margin-top:12px;border:1px solid var(--border);border-radius:8px;'
+        'padding:10px;background:oklch(99% 0.002 240);color:var(--muted);font-size:12px">'
+        "Library lives here so it stays out of the run flow."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+# ------------------------------- Env validation -----------------------------
 missing_planning = not (planning_base_url and planning_api_key and planning_model)
-missing_image = not (image_base_url and image_api_key and image_model)
+missing_image = not (image_base_url and image_api_key)  # image model is now picked in UI
 if missing_planning or missing_image:
     missing: list[str] = []
     if not planning_base_url:
@@ -908,159 +1333,370 @@ if missing_planning or missing_image:
         missing.append("IMAGE_BASE_URL")
     if not image_api_key:
         missing.append("IMAGE_API_KEY")
-    if not image_model:
-        missing.append("IMAGE_MODEL")
 
     st.error("Missing required `.env` variables: " + ", ".join(missing))
     st.caption(f"Expected file: `{_dotenv_path}` (exists: `{_dotenv_path.exists()}`)")
     if _dotenv_path.exists():
-        # Show whether `.env` lines look blank without printing secrets.
         env_text = _dotenv_path.read_text(encoding="utf-8", errors="ignore")
         blank_keys: list[str] = []
         for k in missing:
-            m = re.search(rf"^{re.escape(k)}\\s*=\\s*(.*)$", env_text, flags=re.MULTILINE)
+            m = re.search(rf"^{re.escape(k)}\s*=\s*(.*)$", env_text, flags=re.MULTILINE)
             if m is not None and m.group(1).strip() == "":
                 blank_keys.append(k)
         if blank_keys:
             st.warning(
-                "Your `.env` file contains blank values for: " + ", ".join(blank_keys) + ". Fill them and restart Streamlit."
+                "Your `.env` has blank values for: " + ", ".join(blank_keys)
+                + ". Fill them and restart Streamlit."
             )
     st.info(
-        "Tip: if you export empty `PLANNING_*` / `IMAGE_*` in your shell, they can hide `.env` values. "
-        "This app loads `.env` with **override=True** — restart Streamlit after saving `.env`."
+        "Tip: empty `PLANNING_*` / `IMAGE_*` exports in your shell can hide `.env` values. "
+        "This app loads `.env` with **override=True** — restart Streamlit after editing `.env`."
     )
     st.stop()
 
-col_left, col_right = st.columns([1, 1], gap="large")
+# ------------------------------- Topbar -------------------------------------
+st.markdown(
+    """
+<div class="sd-topbar">
+  <div>
+    <h2>Slide Deck Generator</h2>
+    <p>Turn source text or PDFs into polished, editable PowerPoint decks.</p>
+  </div>
+  <div class="actions"><span>auto-saves to <code>slide-deck/&lt;slug&gt;/</code></span></div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
-with col_left:
-    st.subheader("1) Source content")
-    source_text = st.text_area("Paste your source content", height=360, key="source_text")
-    topic_hint = st.text_input("Topic (optional, improves slug)", key="topic_hint")
-    source_pdf = st.file_uploader(
-        "Or upload a PDF (text is extracted and combined with the box above)",
-        type=["pdf"],
-        key="source_pdf",
+# ------------------------------- Workflow state -----------------------------
+# Tracks step progression for the rail: 0=Create, 1=Configure, 2=Generate, 3=Review.
+if "_active_step" not in st.session_state:
+    st.session_state._active_step = 0
+if "_done_until" not in st.session_state:
+    st.session_state._done_until = -1
+
+# ============================== Step 1: Create ==============================
+_step_rail(active_idx=st.session_state._active_step, done_until=st.session_state._done_until)
+
+st.markdown('<div id="create"></div>', unsafe_allow_html=True)
+col_create_l, col_create_r = st.columns([1.15, 0.85], gap="medium")
+
+with col_create_l:
+    _panel_head(
+        "Create Deck",
+        "Source content",
+        "Paste raw notes, upload a PDF, or use both. Analysis stays readable and non-technical.",
+        badge="draft",
     )
-    pdf_extracted = ""
-    if source_pdf is not None:
-        try:
-            pdf_extracted = extract_pdf_text(source_pdf.getvalue())
-            st.caption(f"PDF: extracted **{len(pdf_extracted):,}** characters from `{source_pdf.name}`.")
-        except Exception as e:
-            st.error(f"Could not read this PDF: {e}")
+    with st.container():
+        st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+        source_text = st.text_area(
+            "Source text",
+            height=240,
+            key="source_text",
+            placeholder="Paste meeting notes, a report excerpt, a founder memo, or long-form research…",
+            label_visibility="collapsed",
+        )
+        source_pdf = st.file_uploader(
+            "Upload source PDF (text is extracted and combined with the box above)",
+            type=["pdf"],
+            key="source_pdf",
+        )
+        topic_hint = st.text_input(
+            "Optional topic hint",
+            key="topic_hint",
+            placeholder="e.g. Market entry briefing",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+pdf_extracted = ""
+if source_pdf is not None:
+    try:
+        pdf_extracted = extract_pdf_text(source_pdf.getvalue())
+    except Exception as e:
+        st.error(f"Could not read this PDF: {e}")
 
 combined_source = "\n\n".join(x for x in (source_text.strip(), pdf_extracted.strip()) if x).strip()
 
-with col_right:
-    st.subheader("2) Confirmation (required)")
-    st.caption("Hard gate from `baoyu-slide-deck`: Step 3+ runs only after these choices are set (auto-saved every run).")
-
-    if not combined_source.strip():
-        st.info("Paste source content or upload a PDF on the left to start.")
-        st.stop()
-
-    words = len(re.findall(r"\w+", combined_source))
-    detected_language = detect_language(combined_source)
-    recommended_style = recommend_style_preset(combined_source)
-    recommended_slides = recommend_slide_count(words)
-    slug_base = topic_hint.strip() or (combined_source.strip().splitlines()[0][:80] if combined_source.strip() else "deck")
-    topic_slug = slugify(slug_base)
-
-    analysis = {
-        "words": words,
-        "detected_language": detected_language,
-        "recommended_style": recommended_style,
-        "recommended_slides": recommended_slides,
-        "topic_slug": topic_slug,
-    }
-
-    st.markdown(
-        f"- Detected language: **{detected_language}**\n"
-        f"- Recommended style: **{recommended_style}**\n"
-        f"- Recommended slides: **{recommended_slides}**"
+with col_create_r:
+    _panel_head(
+        "Auto analysis",
+        "Recommended setup",
+        "Suggestions appear before expensive generation starts.",
     )
-
-    style_choice = st.selectbox(
-        "Style (`--style`)",
-        options=preset_names + ["custom-dimensions"],
-        index=(preset_names.index(recommended_style) if recommended_style in preset_names else preset_names.index(default_preset)),
-        key="style_choice",
-    )
-
-    audience_options = ["beginners", "intermediate", "experts", "executives", "general"]
-    audience_index = audience_options.index(prefs.audience) if prefs.audience in audience_options else 4
-    audience = st.selectbox("Audience (`--audience`)", audience_options, index=audience_index, key="audience")
-
-    lang_options = ["auto", "en", "zh", "ja"]
-    lang_index = lang_options.index(prefs.language) if prefs.language in lang_options else 0
-    lang = st.selectbox("Language (`--lang`)", lang_options, index=lang_index, key="lang")
-
-    slides = st.number_input(
-        "Slides (`--slides`)",
-        min_value=1,
-        max_value=30,
-        value=max(1, min(30, int(recommended_slides))),
-        step=1,
-        key="slides",
-    )
-
-    dims = None
-    if style_choice == "custom-dimensions":
-        st.markdown("Custom dimensions (Round 2)")
-        texture = st.selectbox("Texture", ["clean", "grid", "organic", "pixel", "paper"], key="dim_texture")
-        mood = st.selectbox(
-            "Mood",
-            ["professional", "warm", "cool", "vibrant", "dark", "neutral", "macaron"],
-            key="dim_mood",
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+    if not combined_source:
+        st.markdown(
+            '<div style="color:var(--muted);font-size:13px">'
+            "Paste source content or upload a PDF on the left to see analysis."
+            "</div>",
+            unsafe_allow_html=True,
         )
-        typography = st.selectbox(
-            "Typography",
-            ["geometric", "humanist", "handwritten", "editorial", "technical"],
-            key="dim_typography",
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        words = len(re.findall(r"\w+", combined_source))
+        detected_language = detect_language(combined_source)
+        recommended_style = recommend_style_preset(combined_source)
+        recommended_slides = recommend_slide_count(words)
+        slug_base = topic_hint.strip() or (
+            combined_source.strip().splitlines()[0][:80] if combined_source.strip() else "deck"
         )
-        density = st.selectbox("Density", ["minimal", "balanced", "dense"], index=1, key="dim_density")
-        dims = {"texture": texture, "mood": mood, "typography": typography, "density": density}
+        topic_slug = slugify(slug_base)
+        st.markdown(
+            f"""
+<div class="sd-metric-grid">
+  <div class="sd-metric"><small>Words</small><strong>{words:,}</strong></div>
+  <div class="sd-metric"><small>Language</small><strong>{detected_language.upper()}</strong></div>
+  <div class="sd-metric"><small>Slides</small><strong>{recommended_slides}</strong></div>
+  <div class="sd-metric"><small>Style</small><strong style="font-size:14px">{recommended_style}</strong></div>
+</div>
+<div class="sd-reco">
+  <strong>Editable PPTX is the primary output</strong>
+  <p>Text, charts, dividers, cards, and common shapes are rebuilt as PowerPoint-native objects where possible.</p>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        if source_pdf is not None and pdf_extracted:
+            st.caption(f"PDF: extracted {len(pdf_extracted):,} characters from `{source_pdf.name}`.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("Reference images (`--ref`) (optional)")
-    ref_files = st.file_uploader(
-        "Ref images",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-        key="ref_files",
-    )
-    ref_usage = st.selectbox("Ref usage mode", options=["direct", "style", "palette"], index=0, key="ref_usage")
+# Stop early if no source — Configure / Generate / Review can't proceed.
+if not combined_source:
+    st.stop()
 
-    st.markdown("Image size (must be divisible by 16)")
-    aspect = st.selectbox("Aspect ratio", options=["16:9", "4:3", "custom"], index=0, key="img_aspect")
-    snap_mode = st.selectbox(
-        "Divisible-by-16 rounding",
-        options=["nearest", "down", "up"],
-        index=0,
-        key="img_snap",
-        help="Your image backend requires both width and height divisible by 16.",
+# Build analysis dict for downstream steps.
+analysis = {
+    "words": words,
+    "detected_language": detected_language,
+    "recommended_style": recommended_style,
+    "recommended_slides": recommended_slides,
+    "topic_slug": topic_slug,
+}
+
+# Source has been entered, so Step 1 is effectively done.
+if st.session_state._done_until < 0:
+    st.session_state._done_until = 0
+if st.session_state._active_step < 1:
+    st.session_state._active_step = 1
+
+# ============================== Step 2: Configure ===========================
+st.markdown('<div id="configure"></div><hr/>', unsafe_allow_html=True)
+col_cfg_l, col_cfg_r = st.columns([1.15, 0.85], gap="medium")
+
+with col_cfg_l:
+    _panel_head(
+        "Configure Deck",
+        "Presentation settings",
+        "A confirmation file is written here. Generation starts only after these choices are approved.",
+        badge="confirmation.yaml",
+        badge_kind="good",
     )
-    target_width = st.number_input("Target width (px)", min_value=256, max_value=4096, value=1920, step=16, key="img_w")
-    target_height = st.number_input(
-        "Target height (px) (custom only)",
-        min_value=256,
-        max_value=4096,
-        value=1080,
-        step=16,
-        key="img_h",
-        disabled=(aspect != "custom"),
-    )
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+
+    # Row 1: audience / language
+    c1, c2 = st.columns(2)
+    with c1:
+        audience_options = ["beginners", "intermediate", "experts", "executives", "general"]
+        audience_index = audience_options.index(prefs.audience) if prefs.audience in audience_options else 4
+        audience = st.selectbox("Audience", audience_options, index=audience_index, key="audience")
+    with c2:
+        lang_options = ["auto", "en", "zh", "ja"]
+        lang_index = lang_options.index(prefs.language) if prefs.language in lang_options else 0
+        lang = st.selectbox("Language", lang_options, index=lang_index, key="lang")
+
+    # Row 2: slide count / canvas (aspect)
+    c3, c4 = st.columns(2)
+    with c3:
+        slides = st.number_input(
+            "Slide count",
+            min_value=1, max_value=30,
+            value=max(1, min(30, int(recommended_slides))),
+            step=1, key="slides",
+        )
+    with c4:
+        aspect = st.selectbox(
+            "Output canvas",
+            options=["16:9", "4:3", "custom"],
+            index=0,
+            key="img_aspect",
+            help="Image dimensions get snapped to a multiple of 16 for the backend.",
+        )
+
+    # Row 3: image model picker (NEW) + image size rounding
+    c5, c6 = st.columns(2)
+    with c5:
+        default_image_model = _resolve_default_image_model(image_model_env)
+        if default_image_model not in IMAGE_MODEL_CHOICES:
+            # Show the env-supplied custom model alongside the standard three.
+            choices = [default_image_model] + IMAGE_MODEL_CHOICES
+            default_idx = 0
+        else:
+            choices = IMAGE_MODEL_CHOICES
+            default_idx = choices.index(default_image_model)
+        image_model = st.selectbox(
+            "Image model",
+            options=choices,
+            index=default_idx,
+            key="image_model_choice",
+            help=(
+                "gpt-image-2-cheap — fastest/cheapest draft quality.\n"
+                "gpt-image-2 — balanced default.\n"
+                "nano-banana-pro — highest fidelity, slower & costlier."
+            ),
+        )
+    with c6:
+        snap_mode = st.selectbox(
+            "Divisible-by-16 rounding",
+            options=["nearest", "down", "up"],
+            index=0, key="img_snap",
+        )
+
+    # Row 4: width / height
+    c7, c8 = st.columns(2)
+    with c7:
+        target_width = st.number_input(
+            "Target width (px)",
+            min_value=256, max_value=4096, value=1920, step=16, key="img_w",
+        )
+    with c8:
+        target_height = st.number_input(
+            "Target height (px) — custom only",
+            min_value=256, max_value=4096, value=1080, step=16, key="img_h",
+            disabled=(aspect != "custom"),
+        )
+
     computed_size = compute_image_size(
         aspect=aspect,
         target_width=int(target_width),
         target_height=int(target_height),
         snap_mode=snap_mode,
     )
-    st.info(f"Will use image size: **{computed_size}**")
+    st.markdown(
+        f'<div class="sd-badge good" style="margin-top:6px">image size: {computed_size}</div>',
+        unsafe_allow_html=True,
+    )
 
-    confirm_run = st.button("Confirm & Run Step 3+", type="primary", key="confirm_run")
+    # Visual style cards + native preset list
+    st.markdown(
+        '<div style="display:flex;align-items:center;justify-content:space-between;'
+        'margin:18px 0 8px"><span style="color:var(--muted);font:700 11px/1 ui-monospace,Menlo,monospace;'
+        'letter-spacing:.06em;text-transform:uppercase">Visual style</span></div>',
+        unsafe_allow_html=True,
+    )
+    style_cards = [
+        ("Consulting deck",   "Structured, executive-ready, dense enough for briefing work.",
+         ["#fff", "#f3f5f8", "#1f2937", "#2563eb"], "consulting-deck"),
+        ("Minimal",           "Quiet slides with strong type and sparse visual marks.",
+         ["#fbfbfb", "#111", "#d6d6d6", "#4f46e5"], "minimal"),
+        ("Scientific",        "Charts, evidence, tables, and methodical hierarchy.",
+         ["#0f172a", "#1e293b", "#94a3b8", "#22c55e"], "scientific"),
+    ]
+    cards_html: list[str] = ['<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px">']
+    chosen_quick_style = (
+        recommended_style if recommended_style in [s[3] for s in style_cards]
+        else style_cards[0][3]
+    )
+    for title, desc, swatches, slug in style_cards:
+        active = " active" if slug == chosen_quick_style else ""
+        sw_html = "".join(f'<span class="sd-swatch" style="background:{c}"></span>' for c in swatches)
+        cards_html.append(
+            f'<div class="sd-style-card{active}"><div class="sd-swatches">{sw_html}</div>'
+            f'<div><h4>{title}</h4><p>{desc}</p></div></div>'
+        )
+    cards_html.append("</div>")
+    st.markdown("".join(cards_html), unsafe_allow_html=True)
 
-# Auto mode: skip human “review outline/prompts” pauses (skill allows explicit opt-out; UI automates)
+    # Full preset selector (the cards above are visual hints; this is the source of truth)
+    style_options = preset_names + ["custom-dimensions"]
+    if recommended_style in preset_names:
+        default_style_idx = preset_names.index(recommended_style)
+    elif default_preset in preset_names:
+        default_style_idx = preset_names.index(default_preset)
+    else:
+        default_style_idx = 0
+    style_choice = st.selectbox(
+        "Style preset",
+        options=style_options,
+        index=default_style_idx,
+        key="style_choice",
+        help="All presets from skill/references/styles/. Pick custom-dimensions to use the four sliders below.",
+    )
+
+    dims = None
+    if style_choice == "custom-dimensions":
+        with st.expander("Custom dimensions", expanded=True):
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                texture = st.selectbox("Texture", ["clean", "grid", "organic", "pixel", "paper"], key="dim_texture")
+                typography = st.selectbox(
+                    "Typography",
+                    ["geometric", "humanist", "handwritten", "editorial", "technical"],
+                    key="dim_typography",
+                )
+            with dc2:
+                mood = st.selectbox(
+                    "Mood",
+                    ["professional", "warm", "cool", "vibrant", "dark", "neutral", "macaron"],
+                    key="dim_mood",
+                )
+                density = st.selectbox("Density", ["minimal", "balanced", "dense"], index=1, key="dim_density")
+            dims = {"texture": texture, "mood": mood, "typography": typography, "density": density}
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_cfg_r:
+    _panel_head(
+        "Reference assets",
+        "Optional style inputs",
+        "References are saved with the deck so the run can be audited later.",
+    )
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+    ref_files = st.file_uploader(
+        "PNG, JPG, JPEG, WEBP",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="ref_files",
+    )
+    ref_usage = st.selectbox(
+        "Reference usage mode",
+        options=["direct", "style", "palette"],
+        index=0,
+        key="ref_usage",
+    )
+    st.markdown(
+        """
+<ul style="display:grid;gap:8px;margin:8px 0 0;padding:0;list-style:none">
+  <li style="display:grid;grid-template-columns:18px 1fr;gap:8px;color:var(--muted);font-size:12px">
+    <span style="width:7px;height:7px;margin-top:7px;border-radius:999px;background:var(--accent)"></span>
+    Image dimensions auto-snap to a multiple of 16 (backend constraint).
+  </li>
+  <li style="display:grid;grid-template-columns:18px 1fr;gap:8px;color:var(--muted);font-size:12px">
+    <span style="width:7px;height:7px;margin-top:7px;border-radius:999px;background:var(--accent)"></span>
+    Custom dimensions are available without exposing backend math first.
+  </li>
+  <li style="display:grid;grid-template-columns:18px 1fr;gap:8px;color:var(--muted);font-size:12px">
+    <span style="width:7px;height:7px;margin-top:7px;border-radius:999px;background:var(--accent)"></span>
+    Image model is per-run; nano-banana-pro is best for hero/cover slides.
+  </li>
+</ul>
+""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Confirm button — full-width row below the two columns.
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+confirm_col1, confirm_col2 = st.columns([3, 1])
+with confirm_col2:
+    confirm_run = st.button("Confirm & generate", type="primary", key="confirm_run", use_container_width=True)
+with confirm_col1:
+    st.caption(
+        "Hard gate: outline → prompts → images/charts → editable PPTX runs only after confirmation. "
+        "Generation auto-saves to `slide-deck/" + topic_slug + "/`."
+    )
+
+# Build confirmation dict (used by the pipeline + signature).
 confirmed_params: dict[str, Any] = {
     "style": style_choice,
     "audience": audience,
@@ -1072,8 +1708,10 @@ confirmed_params: dict[str, Any] = {
     "ref_usage": ref_usage,
     "image_aspect": aspect,
     "image_size": computed_size,
+    "image_model": image_model,
 }
 
+# Persist source + analysis bookkeeping (mirrors the skill).
 deck_dir = get_session_deck_dir(topic_slug)
 ensure_dir(deck_dir)
 backup_if_exists(deck_dir / f"source-{topic_slug}.md")
@@ -1094,6 +1732,18 @@ if ref_files:
         dest.write_bytes(f.getvalue())
         refs_meta.append({"ref_id": f"{i:02d}", "filename": dest.name, "usage": ref_usage})
 
+# Configure step is interactive — once user clicks Confirm we move on.
+if st.session_state._done_until < 1 and confirm_run:
+    st.session_state._done_until = 1
+if st.session_state._active_step < 2 and confirm_run:
+    st.session_state._active_step = 2
+
+# ============================== Step 3: Generate ============================
+st.markdown('<div id="generate"></div><hr/>', unsafe_allow_html=True)
+
+# Re-run the rail so it reflects updated state after confirm/run.
+# (The earlier rail render at the top is cosmetic; this one is canonical mid-page.)
+
 sig_obj = {
     "source_text": combined_source,
     "topic_hint": topic_hint,
@@ -1104,7 +1754,7 @@ sig_obj = {
     "planning_base_url": planning_base_url,
     "image_model": image_model,
     "image_base_url": image_base_url,
-    "image_size": confirmed_params.get("image_size") or image_size,
+    "image_size": confirmed_params.get("image_size") or image_size_env,
     "planning_max_tokens": planning_max_tokens,
 }
 sig = stable_hash(sig_obj)
@@ -1113,17 +1763,186 @@ if "last_pipeline_sig" not in st.session_state:
     st.session_state.last_pipeline_sig = ""
 if "approved_sig" not in st.session_state:
     st.session_state.approved_sig = ""
+if "last_pipeline_error" not in st.session_state:
+    st.session_state.last_pipeline_error = ""
 
 if confirm_run:
     st.session_state.approved_sig = sig
-    # force a run even if previously done with same inputs
     st.session_state.last_pipeline_sig = ""
+    st.session_state.last_pipeline_error = ""
 
+# Compute timeline rows from current deck_dir state.
+def _read_timeline_state(d: Path) -> list[tuple[str, str, str, str]]:
+    """Return [(state, title, sub, runtime), ...] for the 5 pipeline stages."""
+    has_source = (d / f"source-{d.name}.md").exists()
+    has_analysis = (d / "analysis.md").exists()
+    has_outline = (d / "outline.md").exists()
+    prompt_dir = d / "prompts"
+    n_prompts = len(list(prompt_dir.glob("*.md"))) if prompt_dir.exists() else 0
+    n_charts_spec = len(list(prompt_dir.glob("*.chart.json"))) if prompt_dir.exists() else 0
+    n_chart_svg = len(list(d.glob("[0-9][0-9]-slide-*.svg")))
+    n_pngs = len(list(d.glob("[0-9][0-9]-slide-*.png")))
+    has_pptx = (d / f"{d.name}.pptx").exists()
+
+    def state(done: bool, started: bool = False) -> str:
+        if done:
+            return "done"
+        if started:
+            return "active"
+        return "queued"
+
+    rows: list[tuple[str, str, str, str]] = []
+    rows.append((
+        state(has_source and has_analysis),
+        "Source and analysis saved",
+        "source-*.md, analysis.md, confirmation.yaml",
+        "✓" if has_source and has_analysis else "—",
+    ))
+    rows.append((
+        state(has_outline, has_source),
+        "Outline generated and validated",
+        f"outline.md{' (present)' if has_outline else ''}",
+        "✓" if has_outline else ("…" if has_source else "—"),
+    ))
+    rows.append((
+        state(n_prompts > 0 or n_charts_spec > 0, has_outline),
+        "Per-slide prompts created",
+        f"{n_prompts} image prompts, {n_charts_spec} chart specs",
+        "✓" if (n_prompts > 0 or n_charts_spec > 0) else ("…" if has_outline else "—"),
+    ))
+    target_assets = max(int(confirmed_params["slides"]), 1)
+    produced_assets = n_pngs + n_chart_svg
+    rows.append((
+        state(produced_assets >= target_assets, n_prompts + n_charts_spec > 0),
+        "Image and chart slides",
+        f"{produced_assets} of {target_assets} produced ({n_chart_svg} chart SVGs)",
+        f"{produced_assets}/{target_assets}",
+    ))
+    rows.append((
+        state(has_pptx, produced_assets > 0),
+        "Editable PPTX assembly",
+        f"{d.name}.pptx" if has_pptx else "Waiting for slide assets",
+        "✓" if has_pptx else ("…" if produced_assets > 0 else "queued"),
+    ))
+    return rows
+
+
+col_gen_l, col_gen_r = st.columns([1.15, 0.85], gap="medium")
+
+with col_gen_l:
+    is_running = (
+        st.session_state.approved_sig == sig
+        and sig != st.session_state.last_pipeline_sig
+        and not st.session_state.last_pipeline_error
+    )
+    if st.session_state.last_pipeline_error:
+        head_badge, head_kind = "needs attention", "bad"
+    elif is_running:
+        head_badge, head_kind = "running", "warn"
+    elif st.session_state.last_pipeline_sig == sig:
+        head_badge, head_kind = "complete", "good"
+    else:
+        head_badge, head_kind = "awaiting confirm", ""
+    _panel_head(
+        "Generate",
+        "Resumable production pipeline",
+        "Long steps show last completed artifact and the safest restart point.",
+        badge=head_badge,
+        badge_kind=head_kind,
+    )
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+
+    rows = _read_timeline_state(deck_dir)
+    timeline_html: list[str] = ['<div class="sd-timeline">']
+    for state, title, sub, runtime in rows:
+        timeline_html.append(
+            f'<div class="sd-trow"><span class="sd-dot {state}"></span>'
+            f'<div><strong>{title}</strong><span class="sub">{sub}</span></div>'
+            f'<span class="sd-runtime">{runtime}</span></div>'
+        )
+    timeline_html.append("</div>")
+    st.markdown("".join(timeline_html), unsafe_allow_html=True)
+
+    # Recovery card — visible whenever a deck folder has any partial output.
+    has_any_output = any(deck_dir.glob("[0-9][0-9]-slide-*.png")) or any(deck_dir.glob("[0-9][0-9]-slide-*.svg"))
+    if has_any_output and not (deck_dir / f"{topic_slug}.pptx").exists():
+        st.markdown(
+            """
+<div class="sd-recovery">
+  <h4>Mid-step recovery available <span class="sd-badge warn">timeout-safe</span></h4>
+  <p>If the process times out or the browser disconnects, resume from the last completed stage instead of starting over. Existing slide images, SVG charts, the outline, and prompts are preserved on disk.</p>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        rc1, rc2 = st.columns([1, 1])
+        with rc1:
+            if st.button("Re-run export only (PPTX + PDF)", key="recovery_export", use_container_width=True):
+                with st.status("Re-running export…", expanded=True) as export_status:
+                    export_status.write("Starting editable PPTX and PDF merge…")
+                    retry_log, retry_err = merge_deck(deck_dir=deck_dir)
+                    export_status.code(retry_log or "(no log)", language="text")
+                if retry_err:
+                    st.warning(retry_err)
+                else:
+                    st.success("Export finished — editable PPTX updated.")
+                st.rerun()
+        with rc2:
+            if st.button("Restart full pipeline", key="recovery_restart", use_container_width=True):
+                st.session_state.last_pipeline_sig = ""
+                st.session_state.last_pipeline_error = ""
+                st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_gen_r:
+    _panel_head(
+        "Recovery paths",
+        "Actionable error states",
+        "Errors describe what to fix, then offer the narrowest retry.",
+    )
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+    mineru_set = bool(os.getenv("MINERU_TOKEN", "").strip())
+    pptx_present = (deck_dir / f"{topic_slug}.pptx").exists()
+    last_err = st.session_state.last_pipeline_error
+    cards: list[tuple[str, str, str]] = []
+    if not mineru_set:
+        cards.append((
+            "Missing MinerU token", "Export blocked",
+            "Add MINERU_TOKEN to `.env`, then re-run export only.",
+        ))
+    if last_err:
+        cards.append(("Last run error", "See message", last_err[:240]))
+    if not last_err and not pptx_present and any(deck_dir.glob("[0-9][0-9]-slide-*.png")):
+        cards.append((
+            "PDF viewer unavailable", "Download still works",
+            "No iframe dependency in the main success state.",
+        ))
+    if not cards:
+        st.markdown(
+            '<div style="color:var(--muted);font-size:13px">No errors. Recovery actions appear here when something goes wrong.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        for small, big, body in cards:
+            st.markdown(
+                f"""
+<div class="sd-metric" style="margin-bottom:10px">
+  <small>{small}</small>
+  <strong style="font-size:16px">{big}</strong>
+  <p style="color:var(--muted);margin:8px 0 0;font-size:12px">{body}</p>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Run pipeline if approved sig matches but hasn't been executed yet.
 if st.session_state.approved_sig != sig:
-    st.warning("Waiting for confirmation. Click **Confirm & Run Step 3+** to proceed.")
+    st.info("Edit settings above, then click **Confirm & generate** to start the pipeline.")
 elif sig != st.session_state.last_pipeline_sig:
     try:
-        with st.status("Running baoyu-slide-deck pipeline…", expanded=True) as status:
+        with st.status("Running skilldeck pipeline…", expanded=True) as status:
             status.write("Step 3: generating outline…")
             run_pipeline(
                 source_text=combined_source,
@@ -1138,94 +1957,223 @@ elif sig != st.session_state.last_pipeline_sig:
                 image_base_url=image_base_url,
                 image_api_key=image_api_key,
                 image_model=image_model,
-                image_size=confirmed_params.get("image_size") or image_size,
+                image_size=confirmed_params.get("image_size") or image_size_env,
                 preset_names=preset_names,
             )
             status.write("Done.")
         st.session_state.last_pipeline_sig = sig
+        st.session_state.last_pipeline_error = ""
+        st.session_state._done_until = max(st.session_state._done_until, 2)
+        st.session_state._active_step = 3
+        st.rerun()
     except Exception as e:
+        st.session_state.last_pipeline_error = str(e)
         st.error(str(e))
         st.stop()
+else:
+    st.session_state._done_until = max(st.session_state._done_until, 2)
+    st.session_state._active_step = 3
 
-st.divider()
-st.subheader("Output")
+# ============================== Step 4: Review ==============================
+st.markdown('<div id="review"></div><hr/>', unsafe_allow_html=True)
 
+# Switch to a previewed historical deck if the sidebar selected one.
 preview_slug = st.session_state.get("_preview_deck_slug")
 if preview_slug:
-    st.info(f"Showing files from **{preview_slug}** (sidebar “Deck history”). Current session topic is **{topic_slug}**.")
     out_slug = preview_slug
     output_deck_dir = DECKS_DIR / preview_slug
+    st.info(
+        f"Showing files from **{preview_slug}** (sidebar deck library). "
+        f"Current session topic is **{topic_slug}**."
+    )
 else:
     out_slug = topic_slug
     output_deck_dir = deck_dir
 
 pptx_path = output_deck_dir / f"{out_slug}.pptx"
 pdf_path = output_deck_dir / f"{out_slug}.pdf"
+images = sorted(output_deck_dir.glob("[0-9][0-9]-slide-*.png"))
+charts = sorted(output_deck_dir.glob("[0-9][0-9]-slide-*.svg"))
+slide_count_actual = len(images) + len(charts)
 
-slide_pngs_for_export = sorted(output_deck_dir.glob("*-slide-*.png"))
-if slide_pngs_for_export:
-    export_help = (
-        "Runs `python -m editable_pptx` and PDF merge only — no outline, prompts, or images regenerated. "
-        "Use after fixing `.env` (e.g. MINERU_TOKEN) or installing `img2pdf`."
-    )
-    if st.button("Re-run export only (editable PPTX + PDF)", help=export_help, key=f"retry_export_{out_slug}"):
-        with st.status("Re-running export…", expanded=True) as export_status:
-            export_status.write("Starting editable PPTX and PDF merge…")
-            retry_log, retry_err = merge_deck(deck_dir=output_deck_dir)
-            export_status.code(retry_log or "(no log)", language="text")
-        if retry_err:
-            st.warning(retry_err)
-        elif pptx_path.exists():
-            st.success("Export finished — editable PPTX updated.")
-        st.rerun()
+col_rev_l, col_rev_r = st.columns([1.15, 0.85], gap="medium")
 
-images = sorted(output_deck_dir.glob("*.png"))
-if images:
-    st.markdown("#### Slide previews (PNG)")
-    st.image([str(p) for p in images], width=420)
+with col_rev_l:
+    review_badge = f"{slide_count_actual} slide{'s' if slide_count_actual != 1 else ''}"
+    review_kind = "good" if slide_count_actual else ""
+    _panel_head(
+        "Review Output",
+        "Slide gallery",
+        "Preview image slides and structured chart slides in one ordered deck view.",
+        badge=review_badge,
+        badge_kind=review_kind,
+    )
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
 
-if pptx_path.exists():
-    st.markdown("#### PowerPoint (editable)")
-    st.caption(
-        "Text and layout come from MinerU + `editable_pptx`; open in PowerPoint / Keynote / LibreOffice to edit."
-    )
-    pptx_bytes = pptx_path.read_bytes()
-    st.download_button(
-        "Download editable PPTX",
-        data=pptx_bytes,
-        file_name=pptx_path.name,
-        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
-    viewer = f"https://view.officeapps.live.com/op/embed.aspx?src={urllib.parse.quote(str(pptx_path.resolve().as_uri()))}"
-    st.caption(
-        "Embedded preview uses Microsoft’s viewer and usually **does not work for local `file://` URLs**. "
-        "Download the file or use the PDF preview below when available."
-    )
-    st.iframe(viewer, height=720)
-else:
-    st.warning(
-        f"No PPTX at `{pptx_path}` yet. If you ran the pipeline, check **MINERU_TOKEN** in `.env` and the "
-        f"**Editable PPTX + PDF export log** expander above. Output name must match folder name `{out_slug}.pptx`."
+    if not (images or charts):
+        st.markdown(
+            '<div style="color:var(--muted);font-size:13px">'
+            "Slides will appear here once generation completes."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        all_slides: list[tuple[Path, str]] = (
+            [(p, "PNG") for p in images] + [(p, "SVG") for p in charts]
+        )
+        all_slides.sort(key=lambda x: x[0].name)
+        # Render thumbs in a 3-column grid.
+        for chunk_start in range(0, len(all_slides), 3):
+            cols = st.columns(3)
+            for i, col in enumerate(cols):
+                idx = chunk_start + i
+                if idx >= len(all_slides):
+                    break
+                p, kind = all_slides[idx]
+                with col:
+                    try:
+                        st.image(str(p), use_container_width=True)
+                    except Exception:
+                        if kind == "SVG":
+                            st.markdown(p.read_text(encoding="utf-8"), unsafe_allow_html=True)
+                    label = p.stem.replace("-slide-", " · ")
+                    st.markdown(
+                        f'<div class="sd-thumb" style="border:none;margin-top:-6px">'
+                        f'<div class="cap"><strong>{label}</strong>'
+                        f'<span class="sd-badge">{kind}</span></div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+    # Download cards — labels live in HTML, buttons sit underneath.
+    st.markdown(
+        """
+<div class="sd-dl-grid">
+  <div class="sd-dl-card">
+    <strong>Editable PowerPoint</strong>
+    <p>Native text, shapes, chart regions, layout elements where possible.</p>
+  </div>
+  <div class="sd-dl-card">
+    <strong>PDF export</strong>
+    <p>Available when export tooling completes successfully.</p>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
-if pdf_path.exists():
-    st.markdown("#### PDF")
-    pdf_bytes = pdf_path.read_bytes()
-    st.download_button(
-        "Download PDF",
-        data=pdf_bytes,
-        file_name=pdf_path.name,
-        mime="application/pdf",
+    dl_a, dl_b = st.columns(2)
+    with dl_a:
+        if pptx_path.exists():
+            st.download_button(
+                "Download PPTX",
+                data=pptx_path.read_bytes(),
+                file_name=pptx_path.name,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+                type="primary",
+                key=f"dl_pptx_{out_slug}",
+            )
+        else:
+            st.button("PPTX not ready", disabled=True, use_container_width=True, key=f"dl_pptx_disabled_{out_slug}")
+    with dl_b:
+        if pdf_path.exists():
+            st.download_button(
+                "Download PDF",
+                data=pdf_path.read_bytes(),
+                file_name=pdf_path.name,
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"dl_pdf_{out_slug}",
+            )
+        else:
+            st.button("PDF not ready", disabled=True, use_container_width=True, key=f"dl_pdf_disabled_{out_slug}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_rev_r:
+    _panel_head(
+        "Export recovery",
+        "Retry without regenerating",
+        "For failed PPTX/PDF assembly after slides already exist.",
     )
-    try:
-        st.pdf(pdf_bytes, height=720)
-    except Exception as e:
-        st.warning(f"Inline PDF viewer unavailable ({e}). Install with: `pip install 'streamlit[pdf]'` and restart.")
-        if len(pdf_bytes) <= 2_000_000:
-            b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+    st.markdown('<div class="sd-panel-body">', unsafe_allow_html=True)
+    if images or charts:
+        if not pptx_path.exists():
             st.markdown(
-                f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="720" type="application/pdf"></iframe>',
+                """
+<div class="sd-recovery" style="margin-top:0">
+  <h4>PPTX export pending <span class="sd-badge warn">needs env</span></h4>
+  <p>Slide images, SVG charts, the outline, and prompts are intact. If MINERU_TOKEN is set, retry the export only.</p>
+</div>
+""",
                 unsafe_allow_html=True,
             )
         else:
-            st.caption("PDF is large; use **Download PDF** above for a reliable view.")
+            st.markdown(
+                """
+<div class="sd-recovery" style="margin-top:0;border-color:oklch(85% 0.05 145);background:oklch(98% 0.02 145)">
+  <h4>Export complete <span class="sd-badge good">ready</span></h4>
+  <p>You can re-run export to refresh the PPTX/PDF without regenerating images.</p>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+        if st.button(
+            "Re-run export only (editable PPTX + PDF)",
+            help="Runs `python -m editable_pptx` and PDF merge only.",
+            key=f"retry_export_{out_slug}",
+            use_container_width=True,
+        ):
+            with st.status("Re-running export…", expanded=True) as export_status:
+                export_status.write("Starting editable PPTX and PDF merge…")
+                retry_log, retry_err = merge_deck(deck_dir=output_deck_dir)
+                export_status.code(retry_log or "(no log)", language="text")
+            if retry_err:
+                st.warning(retry_err)
+            elif pptx_path.exists():
+                st.success("Export finished — editable PPTX updated.")
+            st.rerun()
+    else:
+        st.markdown(
+            '<div style="color:var(--muted);font-size:13px">'
+            "Generate a deck first; export recovery actions appear once slide assets exist."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        '<div style="margin-top:14px;border:1px solid var(--border);border-radius:8px;'
+        'padding:12px;background:oklch(99% 0.002 240);color:var(--muted);font-size:12px">'
+        "Keeps expensive image and chart generation work intact when a late export step fails."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Inline PPTX / PDF viewers (kept below the gallery to match mockup hierarchy).
+if pptx_path.exists():
+    with st.expander("Embedded PPTX viewer (Microsoft Office Online — usually only works for public URLs)", expanded=False):
+        viewer = f"https://view.officeapps.live.com/op/embed.aspx?src={urllib.parse.quote(str(pptx_path.resolve().as_uri()))}"
+        st.iframe(viewer, height=720)
+
+if pdf_path.exists():
+    with st.expander("Inline PDF preview", expanded=False):
+        try:
+            st.pdf(pdf_path.read_bytes(), height=720)
+        except Exception as e:
+            st.warning(f"Inline PDF viewer unavailable ({e}). Install with: `pip install 'streamlit[pdf]'` and restart.")
+            pdf_bytes = pdf_path.read_bytes()
+            if len(pdf_bytes) <= 2_000_000:
+                b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+                st.markdown(
+                    f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="720" type="application/pdf"></iframe>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("PDF is large; use **Download PDF** above for a reliable view.")
+
+# Final state: if review has any output, mark step 4 done.
+if pptx_path.exists() or pdf_path.exists() or images or charts:
+    st.session_state._done_until = max(st.session_state._done_until, 3)
+
+
+

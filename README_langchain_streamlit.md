@@ -2,7 +2,7 @@
 
 This is a small Streamlit app that implements a 3-step workflow for keeping **consistent style** when generating slide decks with NotebookLM:
 
-- Step 1: Pick a reference image (or choose a built-in style preset from `baoyu-slide-deck`)
+- Step 1: Pick a reference image (or choose a built-in style preset from `skill/`)
 - Step 2: Use an LLM to extract style rules + produce NotebookLM-ready prompt snippets
 - Step 3: Generate NotebookLM instructions that explicitly include **“consistent style throughout”**, plus guidance for fine-tuning inconsistent pages
 
@@ -34,6 +34,6 @@ Create/edit `.env` in repo root:
 
 ## Notes
 
-- This app **reuses the style presets + framework docs** under `baoyu-skills/skills/baoyu-slide-deck/references/`.
+- This app **reuses the style presets + framework docs** under `skill/references/`.
 - You can optionally create `app_config.yaml` (see `app_config.example.yaml`) to set defaults.
 

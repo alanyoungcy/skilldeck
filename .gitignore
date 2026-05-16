@@ -41,24 +41,16 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# --- Node (baoyu-skills) ---
+# --- Node ---
 node_modules/
 *.tsbuildinfo
 .npm/
 .pnpm-store/
 
 # --- Generated decks (large binary outputs) ---
-slide-deck/*/deck.pptx
-slide-deck/*/deck.pdf
-slide-deck/*/*.pptx
-slide-deck/*/*.pdf
-slide-deck/*/*-slide-*.png
-slide-deck/*/*-slide-*.jpg
-slide-deck/*/*-slide-*.jpeg
-slide-deck/*/refs/
-slide-deck/*/analysis-backup-*.md
-slide-deck/*/source-*-backup-*.md
-slide-deck/*/crosscheck_report.json
+slide-deck/* 
+skill/references/styles/hsbc.md
+skill/references/styles/gainr.md 
 
 # --- editable_pptx scratch ---
 /tmp_editable_pptx/
@@ -67,5 +59,3 @@ slide-deck/*/crosscheck_report.json
 # --- Logs ---
 *.log
 logs/
-
-baoyu-skills/
